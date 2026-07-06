@@ -269,16 +269,30 @@
   // The lightbox lives inside #view, so navigating away naturally removes it;
   // the document-level key handler is removed both on close and on re-render.
   var lbIndex = -1;
+  var lbReturnFocus = null;         // element to restore focus to on close (a11y)
   function lbClose() {
     var el = document.getElementById('lightbox');
     if (el) el.parentNode.removeChild(el);
     document.removeEventListener('keydown', lbKeys);
     lbIndex = -1;
+    // Restore focus to the tile that opened the lightbox (WCAG 2.4.3 focus order).
+    if (lbReturnFocus && lbReturnFocus.focus) { try { lbReturnFocus.focus(); } catch (e) {} }
+    lbReturnFocus = null;
   }
   function lbKeys(e) {
-    if (e.key === 'Escape') lbClose();
-    else if (e.key === 'ArrowRight') lbShow(lbIndex + 1);
-    else if (e.key === 'ArrowLeft') lbShow(lbIndex - 1);
+    if (e.key === 'Escape') { lbClose(); return; }
+    if (e.key === 'ArrowRight') { lbShow(lbIndex + 1); return; }
+    if (e.key === 'ArrowLeft') { lbShow(lbIndex - 1); return; }
+    if (e.key === 'Tab') {                                   // trap Tab inside the dialog
+      var el = document.getElementById('lightbox');
+      if (!el) return;
+      var f = el.querySelectorAll('button, [href]');
+      if (!f.length) return;
+      var first = f[0], last = f[f.length - 1];
+      if (!el.contains(document.activeElement)) { e.preventDefault(); first.focus(); }
+      else if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last.focus(); }
+      else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }
+    }
   }
   function lbShow(i) {
     if (!galleryItems.length) return;
@@ -286,12 +300,17 @@
     var it = galleryItems[lbIndex];
     var el = document.getElementById('lightbox');
     if (!el) {
+      lbReturnFocus = document.activeElement;   // remember what to restore on close
       el = document.createElement('div');
       el.id = 'lightbox';
       el.className = 'lightbox';
+      el.setAttribute('role', 'dialog');
+      el.setAttribute('aria-modal', 'true');
+      el.setAttribute('tabindex', '-1');
       view.appendChild(el);
       document.addEventListener('keydown', lbKeys);
     }
+    el.setAttribute('aria-label', 'Image viewer: ' + it.title);
     el.innerHTML = '<div class="lb-frame">' +
       '<img src="' + esc(it.file) + '" alt="' + esc(it.title) + '">' +
       '<div class="lb-bar"><span class="lb-title"><b>' + esc(it.title) + '</b> &mdash; ' + esc(it.note) +
@@ -302,6 +321,12 @@
       '<button class="lb-nav lb-prev" data-lb="prev" aria-label="Previous">&#8249;</button>' +
       '<button class="lb-nav lb-next" data-lb="next" aria-label="Next">&#8250;</button>' +
       '</div>';
+    // Move focus into the dialog (on open, and after a prev/next rebuild that would
+    // otherwise drop focus to <body>) so keyboard + screen-reader users stay inside it.
+    if (!el.contains(document.activeElement)) {
+      var closeBtn = el.querySelector('[data-lb="close"]');
+      if (closeBtn) closeBtn.focus();
+    }
   }
 
   // ------------------------------------------------------------------ theater
@@ -331,16 +356,26 @@
       '<div class="card media"><span class="kicker">Living poster</span><h2>The ambient loop</h2>' +
       '<p class="muted">A 10-second seamless loop served as <kbd>video/webm</kbd> (VP9) &mdash; a second video ' +
       'format from the same folder, autoplaying muted like a living poster. The whole file is 29&nbsp;KB.</p>' +
-      '<div class="frame"><video autoplay muted loop playsinline src="assets/loop.webm" width="640" height="360"></video></div></div>' +
+      '<div class="frame"><video id="loopvid" autoplay muted loop playsinline src="assets/loop.webm" width="640" height="360"></video></div></div>' +
       '<div class="card"><span class="kicker">Bring your own premiere</span><h2>Any file streams the same way</h2>' +
       '<p class="muted">Drop any folder with an ' +
       '<kbd>.mp4</kbd> into No Cloud Quick Share and it streams the same way &mdash; multi-gigabyte files ' +
       'are served one bounded slice at a time, so the sharer&rsquo;s memory use stays flat no matter how ' +
       'many people press play.</p></div>';
   }
+  function prefersReducedMotion() {
+    return !!(window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches);
+  }
   function wireTheater() {
     var vid = document.getElementById('film');
     var stat = document.getElementById('seekstat');
+    // Honor prefers-reduced-motion for the autoplaying ambient loop (WCAG 2.2.2):
+    // stop the perpetual motion and expose controls so it can be played on demand.
+    var loop = document.getElementById('loopvid');
+    if (loop && prefersReducedMotion()) {
+      loop.removeAttribute('autoplay'); loop.loop = false; loop.controls = true;
+      try { loop.pause(); } catch (e) {}
+    }
     if (!vid) return;
     Array.prototype.forEach.call(view.querySelectorAll('[data-seek]'), function (b) {
       b.addEventListener('click', function () {
