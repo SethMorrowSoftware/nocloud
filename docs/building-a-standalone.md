@@ -27,7 +27,12 @@ package.
      Browser on `9151`).
 3. **Include the Internet library (libURL).** It is used only for the public-IP lookup
    on the web-link path and is harmless if left out (the lookup is `try`-guarded).
-4. **Nothing else.** No other inclusions, externals, fonts, or bundled resources are
+4. **Include the JSON Library** if you want end-users to be able to add their own API
+   endpoints via a `.qsroutes.json` in the shared folder (see `user-routes.md`). It fails
+   closed like the others: without a JSON decoder the custom-routes feature is simply off
+   and everything else works. (`JSONToArray` works in the IDE without this, but a
+   standalone needs the library ticked in Inclusions.)
+5. **Nothing else.** No other inclusions, externals, fonts, or bundled resources are
    needed. The web-app demo in `../webapp/` is *content the user serves*, not something
    the standalone must bundle.
 

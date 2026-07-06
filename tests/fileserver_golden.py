@@ -27,6 +27,7 @@ Mirrors these LiveCodeScript handlers:
     python3 tests/fileserver_golden.py     # exit 0 = OK, 1 = mismatch
 """
 import sys
+from email.utils import formatdate
 from urllib.parse import unquote, unquote_plus
 
 _fail = []
@@ -137,6 +138,14 @@ _MIME = {
     "woff": "font/woff", "woff2": "font/woff2", "ttf": "font/ttf", "otf": "font/otf",
     "eot": "application/vnd.ms-fontobject", "avif": "image/avif",
     "csv": "text/csv; charset=utf-8",
+    # extended media / data types
+    "flac": "audio/flac", "m4a": "audio/mp4", "aac": "audio/aac",
+    "opus": "audio/ogg", "weba": "audio/webm", "ogv": "video/ogg",
+    "mov": "video/quicktime", "mkv": "video/x-matroska", "avi": "video/x-msvideo",
+    "bmp": "image/bmp", "heic": "image/heic", "heif": "image/heif",
+    "apng": "image/apng", "tiff": "image/tiff", "tif": "image/tiff",
+    "ics": "text/calendar; charset=utf-8", "vtt": "text/vtt; charset=utf-8",
+    "yaml": "application/yaml; charset=utf-8", "yml": "application/yaml; charset=utf-8",
 }
 
 
@@ -428,6 +437,185 @@ def capability_route(decoded_path, token):
     return (tok == token, rest)
 
 
+# ---- qsHttpDate: epoch (UTC seconds) -> HTTP-date / IMF-fixdate --------------
+# Pure integer date math, no timezone conversion (mirrors qsHttpDate + its helpers
+# qsIsLeapYear/qsMonthLength/qsPad2). Empty for a negative/non-integer input. Validated
+# below against the stdlib's email.utils.formatdate(usegmt=True).
+
+def is_leap_year(y):
+    if y % 4 != 0:
+        return False
+    if y % 100 == 0 and y % 400 != 0:
+        return False
+    return True
+
+
+def month_length(m, leap):
+    lens = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+    if m == 2 and leap:
+        return 29
+    return lens[m - 1]
+
+
+def pad2(n):
+    return ("0" + str(n))[-2:]
+
+
+def http_date(epoch):
+    if not isinstance(epoch, int) or epoch < 0:
+        return ""
+    days = epoch // 86400
+    rem = epoch % 86400
+    hour, minute, sec = rem // 3600, (rem % 3600) // 60, rem % 60
+    dow = (days + 4) % 7          # 0=Sun ... 6=Sat (1970-01-01 = Thursday)
+    wdays = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
+    mons = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
+            "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+    year, leap = 1970, True
+    while True:
+        leap = is_leap_year(year)
+        ylen = 366 if leap else 365
+        if days < ylen:
+            break
+        days -= ylen
+        year += 1
+    mon = 1
+    for i in range(1, 13):
+        mlen = month_length(i, leap)
+        if days < mlen:
+            mon = i
+            break
+        days -= mlen
+    day = days + 1
+    return "%s, %s %s %d %s:%s:%s GMT" % (
+        wdays[dow], pad2(day), mons[mon - 1], year,
+        pad2(hour), pad2(minute), pad2(sec))
+
+
+# ---- qsHttpAllow: the Allow header value for a path --------------------------
+# Static verbs GET/HEAD/OPTIONS plus any route method registered for exactly this
+# path, in deterministic (sorted) order. Mirrors qsHttpAllow over the route table.
+
+def http_allow(route_keys, path):
+    extras = sorted({
+        k.split(" ", 1)[0]
+        for k in route_keys
+        if " " in k and k.split(" ", 1)[1] == path
+        and k.split(" ", 1)[0] not in ("GET", "HEAD", "OPTIONS")
+    })
+    return ", ".join(["GET", "HEAD", "OPTIONS"] + extras)
+
+
+# ---- qsEditLoginWait: editor login brute-force backoff -----------------------
+# ms this peer must still wait before another attempt. First _EDIT_FREE_TRIES fails are
+# free; after that the required gap doubles each fail, capped. Constants mirror the kEdit*
+# constants in the script - keep them in lockstep.
+_EDIT_FREE_TRIES = 4
+_EDIT_LOCK_BASE_MS = 1000
+_EDIT_LOCK_CAP_MS = 30000
+
+
+def edit_login_wait(fails, last_ms, now_ms):
+    if not isinstance(fails, int) or fails < _EDIT_FREE_TRIES:
+        return 0
+    exp = fails - _EDIT_FREE_TRIES
+    if exp > 20:
+        exp = 20
+    need = _EDIT_LOCK_BASE_MS * (2 ** exp)
+    if need > _EDIT_LOCK_CAP_MS:
+        need = _EDIT_LOCK_CAP_MS
+    if not isinstance(last_ms, int):
+        return 0
+    elapsed = now_ms - last_ms
+    if elapsed < 0:
+        elapsed = 0            # clock went backwards: never wait more than `need`
+    if elapsed >= need:
+        return 0
+    return need - elapsed
+
+
+# ---- user-defined API routes (.qsroutes.json) security helpers ---------------
+# A user route path must be absolute, traversal-free, control-free, and NEVER under the
+# reserved /_qs/ or /_edit/ namespaces. Mirrors qsUserPathValid.
+
+def user_path_valid(path):
+    if path == "" or path[:1] != "/":
+        return False
+    if ".." in path:
+        return False
+    if any(ord(c) < 32 for c in path):
+        return False
+    if path == "/_qs" or path.startswith("/_qs/"):
+        return False
+    if path == "/_edit" or path.startswith("/_edit/"):
+        return False
+    return True
+
+
+def sanitize_header_value(v):
+    # drop anything that could break out of one header line (CR/LF/NUL/other controls)
+    return "".join(c for c in v if ord(c) >= 32)
+
+
+def sanitize_header_name(n):
+    out = ""
+    for c in n:
+        o = ord(c)
+        if (48 <= o <= 57) or (65 <= o <= 90) or (97 <= o <= 122) or c == "-":
+            out += c
+    return out
+
+
+# ---- render_template: {{...}} substitution in a route body (templating's security core) ----
+# Mirrors qsRenderTemplate + qsTemplateValue + qsTemplateEscape. A route body may reflect
+# request context ({{method}}/{{path}}/{{query.NAME}}); each value is ESCAPED for the body's
+# content-type so a reflected query value can NEVER break the response (inject JSON/HTML/a
+# header/control bytes/executable markup). DEFAULT-DENY: only a json type is JSON-escaped; EVERY
+# other type (html/xml/svg/js/plain/unknown) is HTML-escaped - a markup/active type that got only
+# control-stripping would still execute a reflected <script>. No code runs. ({{now}}/{{date}}
+# read the clock, so they are not pinned here - they resolve to empty in this pure mirror; only
+# the deterministic tokens + the escaping + the render-size cap are golden-checked.)
+_RENDER_MAX = 524288                       # mirrors kRenderMax (512 KB rendered-size guard)
+
+
+def template_value(tok, req):
+    if tok == "method":
+        return req.get("__method", "")
+    if tok == "path":
+        return req.get("__path", "")
+    if tok.startswith("query."):
+        return query_param(req.get("__query", ""), tok[6:])
+    return ""                       # unknown (incl. clock tokens now/date) -> empty here
+
+
+def template_escape(val, ctype):
+    if "json" in ctype:
+        return json_escape(val)
+    return html_escape(val)               # html/xml/svg/js/plain/unknown: escape markup
+
+
+def render_template(text, req, ctype):
+    out = ""
+    rest = text
+    while True:
+        o = rest.find("{{")
+        if o < 0:
+            out += rest
+            break
+        out += rest[:o]                   # literal text before the token
+        rest = rest[o + 2:]
+        c = rest.find("}}")
+        if c < 0:
+            out += "{{" + rest            # unterminated -> emit literally
+            break
+        tok = rest[:c]
+        rest = rest[c + 2:]
+        out += template_escape(template_value(tok.strip(), req), ctype)
+        if len(out.encode("utf-8")) > _RENDER_MAX:
+            return out[:_RENDER_MAX]       # bounded: never build an unbounded string
+    return out
+
+
 def main():
     total = 1000
     # -- byte-range parsing --
@@ -708,13 +896,138 @@ def main():
     ]:
         check("query_param(%r,%r)" % (query, name), query_param(query, name), want)
 
+    # -- HTTP-date formatting: cross-check the pure impl against the stdlib --
+    for epoch in [0, 1, 59, 60, 3599, 3600, 86399, 86400,
+                  951782400, 951868800,        # 2000-02-29 / 2000-03-01 (leap)
+                  1078012800,                   # 2004-02-29 (leap)
+                  1709164800, 1709251200,       # 2024-02-29 / 2024-03-01 (leap)
+                  1751812800, 1767225599,       # 2025 mid / 2025-12-31 23:59:59
+                  1735689600, 2147483647,       # 2025-01-01 / the 2038 boundary
+                  4102444800, 4107456000,       # 2100-01-01 / 2100-02-28 (century, NOT leap)
+                  4133980800]:                  # 2101-01-01 (proves 2100 had 365 days)
+        check("http_date(%d)" % epoch, http_date(epoch), formatdate(epoch, usegmt=True))
+    check("http_date(-1)", http_date(-1), "")
+    check("http_date('x')", http_date("x"), "")
+    check("http_date(0) literal", http_date(0), "Thu, 01 Jan 1970 00:00:00 GMT")
+
+    # -- Allow header: static verbs + registered route methods for a path --
+    _routes = ["GET /_qs/info", "GET /_edit", "POST /_edit/login",
+               "GET /_edit/api/list", "GET /_edit/api/read", "PUT /_edit/api/write"]
+    for path, want in [
+        ("/_edit/login", "GET, HEAD, OPTIONS, POST"),
+        ("/_edit/api/write", "GET, HEAD, OPTIONS, PUT"),
+        ("/_qs/info", "GET, HEAD, OPTIONS"),          # a GET route dedups into the static set
+        ("/nope", "GET, HEAD, OPTIONS"),              # no route -> just the static verbs
+    ]:
+        check("http_allow(%r)" % path, http_allow(_routes, path), want)
+    # multiple non-static methods on one path sort deterministically
+    check("http_allow multi",
+          http_allow(["POST /x", "PUT /x", "DELETE /x", "GET /x"], "/x"),
+          "GET, HEAD, OPTIONS, DELETE, POST, PUT")
+
+    # -- editor login brute-force backoff --
+    for fails, last_ms, now_ms, want in [
+        (0, None, 1000, 0),                     # first attempt: free
+        (3, 500, 600, 0),                       # still within the free tries
+        (4, 1000, 1000, 1000),                  # 1st throttled: base 1s, no time elapsed
+        (4, 1000, 1500, 500),                   # 500ms already waited -> 500 left
+        (4, 1000, 2000, 0),                     # full second elapsed -> allowed
+        (5, 1000, 1000, 2000),                  # doubles: 2s
+        (6, 1000, 1000, 4000),                  # 4s
+        (9, 1000, 1000, 30000),                 # 32s -> capped at 30s
+        (100, 1000, 1000, 30000),               # exponent bounded, still capped
+        (5, None, 1000, 0),                     # no recorded last attempt -> allowed
+        (4, 5000, 3000, 1000),                  # clock skew (now < last): treat as no time waited
+    ]:
+        check("edit_login_wait(%r,%r,%r)" % (fails, last_ms, now_ms),
+              edit_login_wait(fails, last_ms, now_ms), want)
+
+    # -- user-route path validation (reserved namespaces, traversal, controls) --
+    for path, want in [
+        ("/api/hello", True),
+        ("/hello", True),
+        ("/go/docs", True),
+        ("/normal-path_123", True),
+        ("/_qsx", True),                        # not /_qs or /_qs/... -> allowed
+        ("", False),
+        ("api/x", False),                       # must be absolute
+        ("/../etc", False),
+        ("/a/../b", False),
+        ("/_qs", False),                        # reserved (exact)
+        ("/_qs/info", False),                   # reserved (prefix)
+        ("/_edit", False),
+        ("/_edit/login", False),
+        ("/a\nb", False),                       # control byte
+    ]:
+        check("user_path_valid(%r)" % path, user_path_valid(path), want)
+
+    # -- header sanitisation (no CRLF/control injection) --
+    for val, want in [
+        ("value", "value"),
+        ("a\r\nb", "ab"),                       # CR + LF stripped
+        ("a\tb", "ab"),                         # tab (9) stripped
+        ("x\x00y", "xy"),                       # NUL stripped
+        ("keep me", "keep me"),                 # space (32) kept
+    ]:
+        check("sanitize_header_value(%r)" % val, sanitize_header_value(val), want)
+    for name, want in [
+        ("X-Custom", "X-Custom"),
+        ("Content-Type", "Content-Type"),
+        ("bad name", "badname"),                # space dropped
+        ("X:Injection", "XInjection"),          # colon dropped
+        ("a\r\nb", "ab"),
+        ("under_score", "underscore"),          # underscore not a kept token char (strict)
+    ]:
+        check("sanitize_header_name(%r)" % name, sanitize_header_name(name), want)
+
+    # -- template rendering ({{...}} reflected request context, escaped per content-type) --
+    # raw  = the URL-decoded query value '"<b>"' (a quote, <b>, a quote) - the adversarial input.
+    # evil = a reflected <script> payload - the XSS lever a non-html/json type must still defuse.
+    _treq = {"__method": "GET", "__path": "/api/echo",
+             "__query": "name=world&raw=%22%3Cb%3E%22"
+                        "&evil=%3Cscript%3Ealert(1)%3C%2Fscript%3E"}
+    _json_ct = "application/json; charset=utf-8"
+    _html_ct = "text/html; charset=utf-8"
+    _text_ct = "text/plain; charset=utf-8"
+    _svg_ct = "image/svg+xml"
+    _js_ct = "application/javascript"
+    for text, ctype, want in [
+        ("no tokens here", _json_ct, "no tokens here"),
+        ("{{method}}", _json_ct, "GET"),
+        ("path={{path}}", _text_ct, "path=/api/echo"),
+        ("{{ method }}", _json_ct, "GET"),               # surrounding space is trimmed
+        ("{{query.name}}", _text_ct, "world"),
+        ("{{unknown}}", _json_ct, ""),                   # unknown token -> empty
+        ("{{now}}", _json_ct, ""),                       # clock token -> empty in this mirror
+        ("a {{method}} b {{path}} c", _text_ct, "a GET b /api/echo c"),   # multiple tokens
+        ("{{oops", _json_ct, "{{oops"),                  # unterminated -> emitted literally
+        ("x {{oops y", _text_ct, "x {{oops y"),
+        # -- the security core: a reflected value can NEVER break out of the body --
+        ('{"q":"{{query.raw}}"}', _json_ct, '{"q":"\\"<b>\\""}'),   # json: quotes escaped
+        ("<p>{{query.raw}}</p>", _html_ct, "<p>&quot;&lt;b&gt;&quot;</p>"),  # html: <>" escaped
+        ("v={{query.raw}}", _text_ct, "v=&quot;&lt;b&gt;&quot;"),   # plain: HTML-escaped (deny)
+        # -- default-deny: svg / xml / js types escape markup too, so no reflected <script> runs --
+        ("<svg>{{query.evil}}</svg>", _svg_ct,
+           "<svg>&lt;script&gt;alert(1)&lt;/script&gt;</svg>"),
+        ("cb({{query.raw}})", _js_ct, "cb(&quot;&lt;b&gt;&quot;)"),
+    ]:
+        check("render_template(%r,%s)" % (text, ctype.split(";")[0]),
+              render_template(text, _treq, ctype), want)
+
+    # -- render-size cap: a token-saturated body x a huge value stays bounded (no unbounded build) --
+    _cap_req = {"__query": "big=" + ("x" * 200000)}      # one ~200 KB reflected value
+    _capped = render_template("{{query.big}}" * 60, _cap_req, "text/plain")
+    check("render_template cap len", len(_capped), _RENDER_MAX)
+
     if _fail:
         print("fileserver_golden: FAIL\n" + "\n".join(_fail))
         return 1
     print("fileserver_golden: OK (range parse, traversal guard, MIME, icon classify, "
           "HTML escape, capability gate, SPA fallback, HTTP framing, keep-alive req "
           "length, JSON escape, editor confinement, LAN-first gate, query parse, size "
-          "probe, filename sanitise, rate + ETA format all match)")
+          "probe, filename sanitise, rate + ETA format, HTTP-date, Allow header, "
+          "editor login backoff, user-route path + header sanitise, template render + "
+          "escape all match)")
     return 0
 
 

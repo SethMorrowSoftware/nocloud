@@ -631,25 +631,62 @@
       '<p class="muted">The host answers dynamic routes from the stack script. ' +
       'This calls the built-in <kbd>GET /_qs/info</kbd> and shows what comes back &mdash; a real request ' +
       'to the very program serving this page.</p>' +
-      '<div class="row"><button class="btn" id="ping">' + icon('bolt') + 'Call /_qs/info</button></div>' +
+      '<div class="row"><button class="btn" id="ping">' + icon('bolt') + 'Inspect the live host</button></div>' +
       '<div class="term"><div class="term-bar"><span class="term-dots"></span>' +
         '<span class="term-title">GET /_qs/info</span>' +
         '<span class="term-status" id="pingstat"></span></div>' +
         '<pre class="code" id="pingout">(calling&hellip;)</pre></div>' +
-      '<p class="muted note">Add your own with <kbd>qsHttpRoute "GET","/api/thing","myHandler"</kbd> ' +
-      'in the stack, replying via <kbd>qsHttpReply</kbd> &mdash; the Store&rsquo;s checkout page sketches a ' +
-      '<kbd>POST /api/order</kbd> the same way.</p></div>';
+      '<div class="term"><div class="term-bar"><span class="term-dots"></span>' +
+        '<span class="term-title">response headers</span></div>' +
+        '<pre class="code" id="hdrout">(reading&hellip;)</pre></div>' +
+      '<div class="term"><div class="term-bar"><span class="term-dots"></span>' +
+        '<span class="term-title">OPTIONS /</span>' +
+        '<span class="term-status" id="optstat"></span></div>' +
+        '<pre class="code" id="optout">(calling&hellip;)</pre></div>' +
+      '<p class="muted note">Every response carries a <kbd>Date</kbd> and the host answers ' +
+      '<kbd>OPTIONS</kbd> with an <kbd>Allow</kbd> header.</p></div>' +
+      '<div class="card"><span class="kicker">Backend &middot; your own routes</span>' +
+      '<h2>Add API endpoints with a JSON file</h2>' +
+      '<p class="muted">No LiveCode required: drop a <kbd>.qsroutes.json</kbd> in the shared folder and ' +
+      'the host serves the routes you declare &mdash; canned JSON, a file under a friendlier URL, or a ' +
+      'redirect. This demo ships a few; the call below hits <kbd>GET /api/echo</kbd>, which reflects a ' +
+      'query value back through a safe <kbd>{{&hellip;}}</kbd> template (escaped for you, still no code).</p>' +
+      '<div class="term"><div class="term-bar"><span class="term-dots"></span>' +
+        '<span class="term-title">GET /api/echo?msg=&hellip; &middot; from .qsroutes.json</span>' +
+        '<span class="term-status" id="usrstat"></span></div>' +
+        '<pre class="code" id="usrout">(calling&hellip;)</pre></div>' +
+      '<p class="muted note">A route returns a canned body, a file, or a redirect &mdash; no code runs, ' +
+      'reflected values are escaped, and paths under <kbd>/_qs/</kbd> and <kbd>/_edit/</kbd> are reserved. ' +
+      'For dynamic logic, the stack still offers ' +
+      '<kbd>qsHttpRoute "GET","/api/thing","myHandler"</kbd> &rarr; <kbd>qsHttpReply</kbd>.</p></div>';
+  }
+  // The response headers worth surfacing (readable same-origin), in display order.
+  var SHOWN_HEADERS = ['server', 'date', 'content-type', 'content-length',
+    'cache-control', 'accept-ranges', 'x-content-type-options'];
+  function dumpHeaders(r) {
+    var lines = [];
+    for (var i = 0; i < SHOWN_HEADERS.length; i++) {
+      var v = null;
+      try { v = r.headers.get(SHOWN_HEADERS[i]); } catch (e) {}
+      if (v) lines.push(SHOWN_HEADERS[i].replace(/\b\w/g, function (c) { return c.toUpperCase(); }) + ': ' + v);
+    }
+    return lines.length ? lines.join('\n') : '(no readable headers)';
   }
   function wireBackend() {
     var btn = document.getElementById('ping');
     var out = document.getElementById('pingout');
     var stat = document.getElementById('pingstat');
+    var hdr = document.getElementById('hdrout');
+    var optOut = document.getElementById('optout');
+    var optStat = document.getElementById('optstat');
     if (!btn) return;
     function ping() {
       stat.className = 'term-status'; stat.textContent = 'requesting...';
+      if (hdr) hdr.textContent = '(reading...)';
       var t0 = (window.performance && performance.now) ? performance.now() : 0;
       fetch(href('_qs/info')).then(function (r) {
         var ms = t0 ? Math.max(1, Math.round(performance.now() - t0)) : null;
+        if (hdr) hdr.textContent = dumpHeaders(r);       // shows the live Date + Server + ...
         if (!r.ok) throw new Error('HTTP ' + r.status);
         return r.text().then(function (txt) {
           var pretty = txt; try { pretty = JSON.stringify(JSON.parse(txt), null, 2); } catch (e) {}
@@ -664,8 +701,46 @@
         stat.innerHTML = '<span class="no">unavailable here</span>';
       });
     }
-    btn.addEventListener('click', ping);
+    // A live OPTIONS preflight to the folder root: the host replies 200 with an Allow header.
+    function options() {
+      if (!optOut) return;
+      optStat.className = 'term-status'; optStat.textContent = 'requesting...';
+      fetch(href(''), { method: 'OPTIONS' }).then(function (r) {
+        var allow = null; try { allow = r.headers.get('allow'); } catch (e) {}
+        optOut.textContent = allow ? ('Allow: ' + allow) : ('HTTP ' + r.status + ' (no Allow header exposed here)');
+        optStat.className = 'term-status live';
+        optStat.innerHTML = '<span class="dot"></span><span class="ok">' + r.status + '</span>';
+      }).catch(function (e) {
+        optOut.textContent = 'OPTIONS is answered by the live host (not a plain static preview).\n\n' + e;
+        optStat.className = 'term-status';
+        optStat.innerHTML = '<span class="no">unavailable here</span>';
+      });
+    }
+    // A live call to a user-defined route (declared in .qsroutes.json, not in LiveCode).
+    var usrOut = document.getElementById('usrout');
+    var usrStat = document.getElementById('usrstat');
+    function userRoute() {
+      if (!usrOut) return;
+      usrStat.className = 'term-status'; usrStat.textContent = 'requesting...';
+      fetch(href('api/echo?msg=hello%20from%20the%20browser')).then(function (r) {
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        return r.text().then(function (txt) {
+          var pretty = txt; try { pretty = JSON.stringify(JSON.parse(txt), null, 2); } catch (e) {}
+          usrOut.textContent = pretty;
+          usrStat.className = 'term-status live';
+          usrStat.innerHTML = '<span class="dot"></span><span class="ok">' + r.status + '</span>';
+        });
+      }).catch(function (e) {
+        usrOut.textContent = 'This route exists only when the host has read a .qsroutes.json declaring it ' +
+          '(and the engine supports JSON). In a plain static preview there is no host to answer.\n\n' + e;
+        usrStat.className = 'term-status';
+        usrStat.innerHTML = '<span class="no">unavailable here</span>';
+      });
+    }
+    btn.addEventListener('click', function () { ping(); options(); userRoute(); });
     ping();
+    options();
+    userRoute();
   }
 
   // -------------------------------------------------------------------- about
@@ -694,15 +769,58 @@
       '<div class="status" id="swstat">Service worker: ' +
       (swOk ? '<span class="live-chip" id="swchip"><span class="dot"></span><span id="swval">checking&hellip;</span></span>'
             : '<span class="no">not supported by this browser</span>') + '</div></div>' +
+      '<div class="card"><span class="kicker">Transparency &middot; what it hides</span>' +
+      '<h2>The honest privacy model</h2>' +
+      '<p class="muted">Fetched live from <kbd>GET /_qs/transparency</kbd> &mdash; the host stating, in ' +
+      'machine-readable form, exactly what the current transport does and does not hide.</p>' +
+      '<ul class="feat" id="transp"><li><span class="muted">Loading&hellip;</span></li></ul></div>' +
       '<div class="card"><span class="kicker">Host it yourself</span><h2>One folder, no cloud</h2>' +
       '<p class="muted">In No Cloud Quick Share, drag this ' +
       '<kbd>webapp</kbd> folder onto the drop area, then share it over Tor or pick ' +
       '<b>Web link</b>. Open the link and you are looking at this page &mdash; gallery, cinema, shop and ' +
       'all. Every asset is procedurally generated or hand-drawn; nothing here phones home.</p></div>';
   }
+  // Turn the /_qs/transparency JSON into a friendly, honest checklist. Each row is
+  // [good?, label] where good=true shows a green check, false an amber caution.
+  function transparencyRows(d) {
+    var tor = d.transport === 'tor';
+    return [
+      [true, 'Transport: ' + esc(d.transport)],
+      [!d.ip_visible_to_peers, d.ip_visible_to_peers
+        ? 'Your IP is visible to visitors (it is in the web-link address)'
+        : 'Your IP is hidden from visitors'],
+      [!!d.both_ends_hidden, d.both_ends_hidden
+        ? 'Both ends are hidden from each other' : 'The other end is not hidden'],
+      [!!d.transport_encrypted, d.transport_encrypted
+        ? 'Encrypted in transit (onion stream)' : 'Plain HTTP - not encrypted in transit'],
+      [!!d.files_encrypted, d.files_encrypted
+        ? 'Files are passphrase-encrypted' : 'Files are served as-is (passphrase encryption is a separate share-code feature)'],
+      [d.logging === 'none', 'Request logging: ' + esc(String(d.logging))],
+      [!!d.ephemeral, d.ephemeral
+        ? 'Ephemeral - the site exists only while the sharing window is open' : 'Persistent'],
+      [true, tor ? 'Over Tor, this is the strongest posture the tool offers'
+                 : 'Pick the Tor front door for a stronger posture']
+    ];
+  }
   function wireAbout() {
     var val = document.getElementById('swval');
     var chip = document.getElementById('swchip');
+    var transp = document.getElementById('transp');
+    if (transp) {
+      fetch(href('_qs/transparency'), { headers: { 'accept': 'application/json' } })
+        .then(function (r) { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
+        .then(function (d) {
+          transp.innerHTML = transparencyRows(d).map(function (row) {
+            return '<li><span class="dot ' + (row[0] ? '' : 'q') + '">' +
+              (row[0] ? icon('check') : '?') + '</span><span>' + row[1] + '</span></li>';
+          }).join('');
+        })
+        .catch(function () {
+          transp.innerHTML = '<li><span class="muted">This lights up when the folder is served by ' +
+            'No Cloud Quick Share (not in a plain static preview). The honest, full write-up lives in ' +
+            '<kbd>docs/what-it-hides.md</kbd>.</span></li>';
+        });
+    }
     if (!val) return;
     if (window.isSecureContext && 'serviceWorker' in navigator) {
       navigator.serviceWorker.register(href('sw.js')).then(function () {
