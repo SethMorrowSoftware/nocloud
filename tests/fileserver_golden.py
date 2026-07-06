@@ -569,10 +569,14 @@ def sanitize_header_name(n):
 # ---- render_template: {{...}} substitution in a route body (templating's security core) ----
 # Mirrors qsRenderTemplate + qsTemplateValue + qsTemplateEscape. A route body may reflect
 # request context ({{method}}/{{path}}/{{query.NAME}}); each value is ESCAPED for the body's
-# content-type (JSON-escape for a json type, HTML-escape for html, else control-stripped) so a
-# reflected query value can NEVER break the response (inject JSON/HTML/a header/control bytes).
-# No code runs. ({{now}}/{{date}} read the clock, so they are not pinned here - they resolve to
-# empty in this pure mirror; only the deterministic tokens + the escaping are golden-checked.)
+# content-type so a reflected query value can NEVER break the response (inject JSON/HTML/a
+# header/control bytes/executable markup). DEFAULT-DENY: only a json type is JSON-escaped; EVERY
+# other type (html/xml/svg/js/plain/unknown) is HTML-escaped - a markup/active type that got only
+# control-stripping would still execute a reflected <script>. No code runs. ({{now}}/{{date}}
+# read the clock, so they are not pinned here - they resolve to empty in this pure mirror; only
+# the deterministic tokens + the escaping + the render-size cap are golden-checked.)
+_RENDER_MAX = 524288                       # mirrors kRenderMax (512 KB rendered-size guard)
+
 
 def template_value(tok, req):
     if tok == "method":
@@ -587,9 +591,7 @@ def template_value(tok, req):
 def template_escape(val, ctype):
     if "json" in ctype:
         return json_escape(val)
-    if "html" in ctype:
-        return html_escape(val)
-    return sanitize_header_value(val)     # plain/other: strip control bytes
+    return html_escape(val)               # html/xml/svg/js/plain/unknown: escape markup
 
 
 def render_template(text, req, ctype):
@@ -609,6 +611,8 @@ def render_template(text, req, ctype):
         tok = rest[:c]
         rest = rest[c + 2:]
         out += template_escape(template_value(tok.strip(), req), ctype)
+        if len(out.encode("utf-8")) > _RENDER_MAX:
+            return out[:_RENDER_MAX]       # bounded: never build an unbounded string
     return out
 
 
@@ -977,12 +981,16 @@ def main():
         check("sanitize_header_name(%r)" % name, sanitize_header_name(name), want)
 
     # -- template rendering ({{...}} reflected request context, escaped per content-type) --
-    # raw = the URL-decoded query value '"<b>"' (a quote, <b>, a quote) - the adversarial input.
+    # raw  = the URL-decoded query value '"<b>"' (a quote, <b>, a quote) - the adversarial input.
+    # evil = a reflected <script> payload - the XSS lever a non-html/json type must still defuse.
     _treq = {"__method": "GET", "__path": "/api/echo",
-             "__query": "name=world&raw=%22%3Cb%3E%22"}
+             "__query": "name=world&raw=%22%3Cb%3E%22"
+                        "&evil=%3Cscript%3Ealert(1)%3C%2Fscript%3E"}
     _json_ct = "application/json; charset=utf-8"
     _html_ct = "text/html; charset=utf-8"
     _text_ct = "text/plain; charset=utf-8"
+    _svg_ct = "image/svg+xml"
+    _js_ct = "application/javascript"
     for text, ctype, want in [
         ("no tokens here", _json_ct, "no tokens here"),
         ("{{method}}", _json_ct, "GET"),
@@ -997,10 +1005,19 @@ def main():
         # -- the security core: a reflected value can NEVER break out of the body --
         ('{"q":"{{query.raw}}"}', _json_ct, '{"q":"\\"<b>\\""}'),   # json: quotes escaped
         ("<p>{{query.raw}}</p>", _html_ct, "<p>&quot;&lt;b&gt;&quot;</p>"),  # html: <>" escaped
-        ("v={{query.raw}}", _text_ct, 'v="<b>"'),        # plain: printable kept, no controls
+        ("v={{query.raw}}", _text_ct, "v=&quot;&lt;b&gt;&quot;"),   # plain: HTML-escaped (deny)
+        # -- default-deny: svg / xml / js types escape markup too, so no reflected <script> runs --
+        ("<svg>{{query.evil}}</svg>", _svg_ct,
+           "<svg>&lt;script&gt;alert(1)&lt;/script&gt;</svg>"),
+        ("cb({{query.raw}})", _js_ct, "cb(&quot;&lt;b&gt;&quot;)"),
     ]:
         check("render_template(%r,%s)" % (text, ctype.split(";")[0]),
               render_template(text, _treq, ctype), want)
+
+    # -- render-size cap: a token-saturated body x a huge value stays bounded (no unbounded build) --
+    _cap_req = {"__query": "big=" + ("x" * 200000)}      # one ~200 KB reflected value
+    _capped = render_template("{{query.big}}" * 60, _cap_req, "text/plain")
+    check("render_template cap len", len(_capped), _RENDER_MAX)
 
     if _fail:
         print("fileserver_golden: FAIL\n" + "\n".join(_fail))

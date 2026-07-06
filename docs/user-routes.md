@@ -87,9 +87,16 @@ present the precedence is `redirect` > `file` > `body`.
 ## Template placeholders (`{{...}}`)
 
 Set `"template": true` and a `body` can reflect a little request context. Each placeholder is
-replaced with its value **escaped for the response `type`** (JSON-escaped for a `json` type,
-HTML-escaped for an `html` type, otherwise control-stripped) — so a visitor-supplied value can
-never break your JSON, inject HTML, or split a header. Unknown placeholders become empty.
+replaced with its value **escaped for the response `type`**: JSON-escaped for a `json` type, and
+**HTML-escaped for everything else** (HTML, SVG, XML, JavaScript, plain text, …). That
+default-deny escaping means a visitor-supplied value can never inject markup — a reflected
+`<script>` in, say, an `image/svg+xml` body comes out inert as `&lt;script&gt;`. Unknown
+placeholders become empty.
+
+> **Footgun:** escaping makes a value safe as *text* inside JSON/HTML/SVG. It does **not** make a
+> value safe when you drop it into a **URL** (`href="{{query.u}}"` — a `javascript:` URL still
+> works) or into a **code position** (`cb({{query.q}})` without quotes). Reflect values into text
+> or quoted-string positions, not into code or bare URLs.
 
 | Placeholder | Becomes |
 |---|---|
@@ -109,10 +116,14 @@ There is still **no scripting** — templating only substitutes these fixed, esc
   `qsHttpRoute "GET","/api/thing","myHandler"` → `qsHttpReply` inside the script.
 - **Reserved:** paths under `/_qs/` (the host's own info/transparency routes) and `/_edit/`
   (the LAN editor) can never be overridden, and an invalid route is skipped, not fatal.
+- **Dotfiles stay hidden:** a `file` route can't point at a hidden dot-file (`.env`, `.git/…`,
+  `.qsroutes.json` itself) — those are invisible over both transports, exactly as they are to
+  the static file paths. Such a route is skipped.
 - **Reload:** the file is read when you start sharing the folder. If you edit it while
   sharing, stop and re-share (or share it again) to pick up the changes.
 - **Limits:** up to 100 routes per file; the config file is read up to 256 KB; each inline
-  body is capped at 64 KB. A malformed file disables *only* custom routes, never the server.
+  body is capped at 64 KB and a templated body renders up to 512 KB. A malformed file disables
+  *only* custom routes, never the server.
 - **Privacy:** these routes are served over whichever transport you picked, with the same
   honesty as everything else — a web link exposes your IP; Tor hides both ends. Nothing here
   changes that (see `what-it-hides.md`).

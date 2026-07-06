@@ -261,6 +261,9 @@ constant kUserRoutesFile = ".qsroutes.json"  -- per-folder API route config (a d
 constant kUserRoutesMax = 100          -- cap on user-declared routes from one config (anti-abuse)
 constant kUserRoutesFileMax = 262144   -- cap on the config file we will read (256 KB)
 constant kUserBodyMax = 65536          -- cap on one inline route body (64 KB)
+constant kRenderMax = 524288           -- cap on one templated body's RENDERED size (512 KB):
+                                       -- a token-heavy body x a huge reflected value must not
+                                       -- build an unbounded string (memory-amplification guard)
 constant kAnonSizeWarn = 268435456     -- 256 MiB: warn (never block) above this, anon path
 constant kTorSocksPort = "9050"        -- system/standalone tor
 constant kTorControlPort = "9051"
@@ -4049,6 +4052,10 @@ command qsLoadUserRoutes pRoot
             end if
             put tStat into tDesc["status"]
          else if tRoute["file"] is not empty and tRoute["file"] is not an array then
+            if qsHasDotSegment(tRoute["file"]) then
+               next repeat                          -- a file route must not reach a hidden dotfile
+            end if                                  -- (.qsroutes.json/.git/.env stay invisible, as
+                                                    --  they are to the static pipeline)
             put "file" into tDesc["kind"]
             put tRoute["file"] into tDesc["file"]   -- confined to pRoot at serve time (qsEditSafePath)
             if tRoute["type"] is not empty and tRoute["type"] is not an array then
@@ -4207,6 +4214,9 @@ function qsRenderTemplate pText, pRequest, pCtype
       put char 1 to (tClose - 1) of tRest into tTok
       put char (tClose + 2) to -1 of tRest into tRest
       put qsTemplateEscape(qsTemplateValue(qsTrim(tTok), pRequest), pCtype) after tOut
+      if the number of bytes in tOut > kRenderMax then
+         return char 1 to kRenderMax of tOut     -- bounded: never build an unbounded string
+      end if
    end repeat
    return tOut
 end qsRenderTemplate
@@ -4229,13 +4239,17 @@ end qsTemplateValue
 
 -- Escape a substituted value for the response body's content-type. Pure; golden: it is the
 -- security core of templating (a reflected query value must never inject JSON/HTML/controls).
+-- DEFAULT-DENY: only a json type gets JSON-escaping; EVERY other type is HTML-escaped. That is
+-- deliberate - a markup / active type the author might pick (image/svg+xml, text/xml,
+-- application/javascript) that got only control-stripping would still execute a reflected
+-- <script>. HTML-escaping neutralises < > & " ' for every text type; on an inert text/plain
+-- body it is merely cosmetic (a literal "<" shows as "&lt;"), never a correctness hazard. A
+-- value in a URL/JS-code position is still an author footgun escaping cannot fix (see the docs).
 function qsTemplateEscape pVal, pCtype
    if pCtype contains "json" then
       return qsJsonEscape(pVal)
-   else if pCtype contains "html" then
-      return qsFsHtmlEscape(pVal)
    end if
-   return qsSanitizeHeaderValue(pVal)          -- plain/other: strip control bytes
+   return qsFsHtmlEscape(pVal)                  -- html/xml/svg/js/plain/unknown: escape markup
 end qsTemplateEscape
 
 -- ============================================================================
