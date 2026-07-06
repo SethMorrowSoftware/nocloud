@@ -527,6 +527,8 @@ def edit_login_wait(fails, last_ms, now_ms):
     if not isinstance(last_ms, int):
         return 0
     elapsed = now_ms - last_ms
+    if elapsed < 0:
+        elapsed = 0            # clock went backwards: never wait more than `need`
     if elapsed >= need:
         return 0
     return need - elapsed
@@ -818,7 +820,9 @@ def main():
                   1078012800,                   # 2004-02-29 (leap)
                   1709164800, 1709251200,       # 2024-02-29 / 2024-03-01 (leap)
                   1751812800, 1767225599,       # 2025 mid / 2025-12-31 23:59:59
-                  1735689600, 2147483647]:      # 2025-01-01 / the 2038 boundary
+                  1735689600, 2147483647,       # 2025-01-01 / the 2038 boundary
+                  4102444800, 4107456000,       # 2100-01-01 / 2100-02-28 (century, NOT leap)
+                  4133980800]:                  # 2101-01-01 (proves 2100 had 365 days)
         check("http_date(%d)" % epoch, http_date(epoch), formatdate(epoch, usegmt=True))
     check("http_date(-1)", http_date(-1), "")
     check("http_date('x')", http_date("x"), "")
@@ -851,6 +855,7 @@ def main():
         (9, 1000, 1000, 30000),                 # 32s -> capped at 30s
         (100, 1000, 1000, 30000),               # exponent bounded, still capped
         (5, None, 1000, 0),                     # no recorded last attempt -> allowed
+        (4, 5000, 3000, 1000),                  # clock skew (now < last): treat as no time waited
     ]:
         check("edit_login_wait(%r,%r,%r)" % (fails, last_ms, now_ms),
               edit_login_wait(fails, last_ms, now_ms), want)

@@ -4010,6 +4010,9 @@ function qsEditLoginWait pFails, pLastMs, pNowMs
       return 0
    end if
    put pNowMs - pLastMs into tElapsed
+   if tElapsed < 0 then
+      put 0 into tElapsed                  -- clock went backwards: never wait more than tNeed
+   end if
    if tElapsed >= tNeed then
       return 0
    end if
@@ -4366,7 +4369,9 @@ command qsFsServePath pStream, pHeaders
       exit qsFsServePath
    end if
    if tMethod is "OPTIONS" then
-      qsFsSendText pStream, "204 No Content", "text/plain; charset=utf-8", "", ("Allow: " & qsHttpAllow(tPath) & tCrlf)
+      -- 200 with an empty body (not 204: a 204 must not carry Content-Length, which the
+      -- shared text sender always sets). Advertise the methods this path accepts.
+      qsFsSendText pStream, "200 OK", "text/plain; charset=utf-8", "", ("Allow: " & qsHttpAllow(tPath) & tCrlf)
       exit qsFsServePath
    end if
    if tMethod is not "GET" and tMethod is not "HEAD" then
@@ -5328,7 +5333,9 @@ command qsCwServe pSocketID
       exit qsCwServe
    end if
    if tMethod is "OPTIONS" then
-      qsCwSendText pSocketID, "204 No Content", "text/plain; charset=utf-8", "", ("Allow: " & qsHttpAllow(tRest) & tCrlf)
+      -- 200 + empty body (not 204: a 204 must not carry the Content-Length the shared
+      -- sender always sets); keep-alive stays clean since the body is empty.
+      qsCwSendText pSocketID, "200 OK", "text/plain; charset=utf-8", "", ("Allow: " & qsHttpAllow(tRest) & tCrlf)
       exit qsCwServe
    end if
    if tMethod is not "GET" and tMethod is not "HEAD" then
