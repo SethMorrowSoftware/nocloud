@@ -60,8 +60,8 @@ local sPolling          -- "true" while the poll/repaint loops are armed
 local sShareCode        -- the most recent file's share code (plain hash or BTXQS1:)
 local sCanEncrypt       -- "true" if cryptoXT (libsodium) is installed + working
 local sHasJson          -- "true" if the engine can parse JSON (JSONToArray probed once; fail-closed)
-local sUserRoutes       -- array: "METHOD /path" -> a validated route descriptor (from .qsroutes.json)
-local sUserRoutesRoot   -- the folder root sUserRoutes was loaded for (reload when the share changes)
+local sUserRoutes       -- array: root -> ("METHOD /path" -> descriptor), from each folder's .qsroutes.json
+local sUserRoutesLoaded -- array: root -> "true" once that folder's .qsroutes.json has been read (or skipped)
 local sPendingKey       -- array: info-hash -> 32-byte file key, for a download to decrypt
 local sPendingName      -- array: info-hash -> original filename, for that download
 local sXferName         -- array: info-hash -> real name to SHOW locally (swarm sees .enc)
@@ -1111,8 +1111,8 @@ command qsStop
    end repeat
    put empty into sTempEnc
    put empty into sOnionXfers
-   put empty into sUserRoutes         -- forget custom routes; a re-share reloads .qsroutes.json
-   put empty into sUserRoutesRoot
+   put empty into sUserRoutes          -- forget custom routes; a re-share reloads .qsroutes.json
+   put empty into sUserRoutesLoaded
    -- reset the My Shares bookkeeping too: torrent handle values restart at a fixed
    -- number for a fresh session, so a stale handle->code entry left here would make a
    -- reopened session's first download look like a seed with someone else's code.
@@ -2062,6 +2062,8 @@ command qsOnionStopShare
       catch tErr
       end try
    end if
+   delete variable sUserRoutes[sActiveShare["root"]]   -- custom routes reload if re-shared
+   delete variable sUserRoutesLoaded[sActiveShare["root"]]
    put empty into sActiveShare
    put empty into sXferSel
    if tCode is not empty and the text of field "qsCode" is tCode then
@@ -3958,41 +3960,50 @@ function qsSanitizeHeaderName pName
    return tOut
 end qsSanitizeHeaderName
 
--- Reload sUserRoutes only when the served folder changes (a cheap string compare per
--- request). A no-op unless JSON decoding is available and a folder is being shared.
+-- Load a folder's routes exactly once (per-root cache), so a Tor folder share and a
+-- clearweb share that are up at the same time never see each other's routes and neither
+-- reparses on every request. A no-op unless JSON decoding is available.
 command qsEnsureUserRoutes pRoot
-   if pRoot is sUserRoutesRoot then
+   if pRoot is empty then
       exit qsEnsureUserRoutes
    end if
-   put pRoot into sUserRoutesRoot
-   put empty into sUserRoutes
-   if not sHasJson or pRoot is empty then
+   if sUserRoutesLoaded[pRoot] is "true" then
+      exit qsEnsureUserRoutes
+   end if
+   put "true" into sUserRoutesLoaded[pRoot]
+   if not sHasJson then
       exit qsEnsureUserRoutes
    end if
    qsLoadUserRoutes pRoot
 end qsEnsureUserRoutes
 
--- Read + parse + validate <root>/.qsroutes.json into sUserRoutes. Every step is guarded so
--- a malformed config disables just this feature (never the server). Each route becomes a
--- descriptor: kind ("body"/"redirect"), status, ctype, body OR location, and a newline-
--- separated block of already-sanitised extra header lines.
+-- Read + parse + validate <root>/.qsroutes.json into sUserRoutes[pRoot]. EVERY step is
+-- guarded (read/decode, the JSON parse, and each route) so a malformed config disables just
+-- this feature - never the server, never the request that triggered the load. Each route
+-- becomes a descriptor: kind ("body"/"file"/"redirect"), status, ctype, body|file|location,
+-- an optional template flag, and a newline-separated block of already-sanitised header lines.
 command qsLoadUserRoutes pRoot
    local tFile, tText, tData, tList, tI, tRoute, tCount, tErr
-   local tMethod, tPath, tKey, tDesc, tHkey, tHval, tHname, tStat, tHdrs
+   local tMethod, tPath, tKey, tDesc, tHkey, tHval, tHname, tHlow, tStat, tHdrs
    put pRoot & "/" & kUserRoutesFile into tFile
    if there is no file tFile then
       exit qsLoadUserRoutes
    end if
    put "" into tText
-   open file tFile for binary read
-   if the result is not empty then
-      exit qsLoadUserRoutes
-   end if
-   read from file tFile for kUserRoutesFileMax     -- bounded: this is config, not payload
-   put textDecode(it, "UTF-8") into tText
    try
+      open file tFile for binary read
+      if the result is not empty then
+         exit qsLoadUserRoutes
+      end if
+      read from file tFile for kUserRoutesFileMax  -- bounded: this is config, not payload
+      put textDecode(it, "UTF-8") into tText
       close file tFile
    catch tErr
+      try
+         close file tFile
+      catch tErr
+      end try
+      exit qsLoadUserRoutes
    end try
    try
       put JSONToArray(tText) into tData
@@ -4000,66 +4011,105 @@ command qsLoadUserRoutes pRoot
       qsLog ("Ignoring " & kUserRoutesFile & ": not valid JSON.")
       exit qsLoadUserRoutes
    end try
+   if tData["routes"] is not an array then
+      exit qsLoadUserRoutes
+   end if
    put tData["routes"] into tList
    put the number of elements of tList into tCount
    if tCount > kUserRoutesMax then
       put kUserRoutesMax into tCount
    end if
    repeat with tI = 1 to tCount
-      put tList[tI] into tRoute
-      put toUpper(qsTrim(tRoute["method"])) into tMethod
-      if tMethod is empty then
-         put "GET" into tMethod
-      end if
-      put tRoute["path"] into tPath
-      if not qsUserPathValid(tPath) then
-         next repeat
-      end if
-      put empty into tDesc
-      if tRoute["redirect"] is not empty then
-         put "redirect" into tDesc["kind"]
-         put qsSanitizeHeaderValue(tRoute["redirect"]) into tDesc["location"]
-         put tRoute["status"] into tStat
-         if tStat is not among the items of "301,302,303,307,308" then
-            put 302 into tStat
+      try
+         put tList[tI] into tRoute
+         if tRoute is not an array then
+            next repeat
          end if
-         put tStat into tDesc["status"]
-      else
-         put "body" into tDesc["kind"]
-         put tRoute["body"] into tDesc["body"]
-         if the number of bytes in tDesc["body"] > kUserBodyMax then
-            next repeat                       -- oversized inline body: skip
+         if tRoute["method"] is an array or tRoute["path"] is an array then
+            next repeat
          end if
-         if tRoute["type"] is not empty then
-            put qsSanitizeHeaderValue(tRoute["type"]) into tDesc["ctype"]
-         else
-            put "text/plain; charset=utf-8" into tDesc["ctype"]
+         put toUpper(qsTrim(tRoute["method"])) into tMethod
+         if tMethod is empty then
+            put "GET" into tMethod
          end if
-         put tRoute["status"] into tStat
-         if tStat is not an integer or tStat < 100 or tStat > 599 then
-            put 200 into tStat
+         put tRoute["path"] into tPath
+         if not qsUserPathValid(tPath) then
+            next repeat
          end if
-         put tStat into tDesc["status"]
-      end if
-      put "" into tHdrs
-      if tRoute["cors"] is "true" then
-         put "Access-Control-Allow-Origin: *" & return after tHdrs
-      end if
-      if tRoute["headers"] is an array then
-         repeat for each key tHkey in tRoute["headers"]
-            put qsSanitizeHeaderName(tHkey) into tHname
-            put qsSanitizeHeaderValue(tRoute["headers"][tHkey]) into tHval
-            if tHname is not empty and tHval is not empty then
-               put tHname & ": " & tHval & return after tHdrs
+         put empty into tDesc
+         if tRoute["redirect"] is not empty and tRoute["redirect"] is not an array then
+            put "redirect" into tDesc["kind"]
+            put qsSanitizeHeaderValue(tRoute["redirect"]) into tDesc["location"]
+            if tDesc["location"] is empty then
+               next repeat                       -- a redirect with no Location is meaningless
             end if
-         end repeat
-      end if
-      put tHdrs into tDesc["headers"]
-      put tMethod & space & tPath into tKey     -- last write wins on a duplicate key
-      put tDesc into sUserRoutes[tKey]
+            put tRoute["status"] into tStat
+            if not (tStat is 301 or tStat is 302 or tStat is 303 or tStat is 307 or tStat is 308) then
+               put 302 into tStat
+            end if
+            put tStat into tDesc["status"]
+         else if tRoute["file"] is not empty and tRoute["file"] is not an array then
+            put "file" into tDesc["kind"]
+            put tRoute["file"] into tDesc["file"]   -- confined to pRoot at serve time (qsEditSafePath)
+            if tRoute["type"] is not empty and tRoute["type"] is not an array then
+               put qsSanitizeHeaderValue(tRoute["type"]) into tDesc["ctype"]
+            end if                                  -- empty ctype -> derive from the file extension
+         else
+            put "body" into tDesc["kind"]
+            if tRoute["body"] is an array then
+               next repeat                          -- a non-scalar body is malformed: skip
+            end if
+            put tRoute["body"] into tDesc["body"]
+            if the number of bytes in tDesc["body"] > kUserBodyMax then
+               next repeat                          -- oversized inline body: skip
+            end if
+            if tRoute["type"] is not empty and tRoute["type"] is not an array then
+               put qsSanitizeHeaderValue(tRoute["type"]) into tDesc["ctype"]
+            else
+               put "text/plain; charset=utf-8" into tDesc["ctype"]
+            end if
+            put tRoute["status"] into tStat
+            if tStat is not an integer or tStat < 100 or tStat > 599 then
+               put 200 into tStat
+            end if
+            put tStat into tDesc["status"]
+            if tRoute["template"] is "true" then
+               put "true" into tDesc["template"]    -- opt-in {{...}} substitution on the body
+            end if
+         end if
+         put "" into tHdrs
+         if tRoute["cors"] is "true" then
+            put "Access-Control-Allow-Origin: *" & return after tHdrs
+         end if
+         if tRoute["headers"] is an array then
+            repeat for each key tHkey in tRoute["headers"]
+               if tRoute["headers"][tHkey] is an array then
+                  next repeat
+               end if
+               put qsSanitizeHeaderName(tHkey) into tHname
+               put toLower(tHname) into tHlow
+               -- deny framing / hop-by-hop / server-owned headers so a route can never
+               -- desync keep-alive or split a response (request-smuggling class)
+               if tHname is empty or tHlow is "content-length" or tHlow is "transfer-encoding" \
+                     or tHlow is "connection" or tHlow is "content-type" or tHlow is "content-range" \
+                     or tHlow is "location" or tHlow is "host" or tHlow is "date" then
+                  next repeat
+               end if
+               put qsSanitizeHeaderValue(tRoute["headers"][tHkey]) into tHval
+               if tHval is not empty then
+                  put tHname & ": " & tHval & return after tHdrs
+               end if
+            end repeat
+         end if
+         put tHdrs into tDesc["headers"]
+         put tMethod & space & tPath into tKey      -- last write wins on a duplicate key
+         put tDesc into sUserRoutes[pRoot][tKey]
+      catch tErr
+         -- a malformed route is skipped, never fatal to the load or the request
+      end try
    end repeat
-   if the number of elements of sUserRoutes > 0 then
-      qsLog ("Loaded " & the number of elements of sUserRoutes & " custom API route(s) from " & kUserRoutesFile & ".")
+   if the number of elements of sUserRoutes[pRoot] > 0 then
+      qsLog ("Loaded " & the number of elements of sUserRoutes[pRoot] & " custom API route(s) from " & kUserRoutesFile & ".")
    end if
 end qsLoadUserRoutes
 
@@ -4077,10 +4127,23 @@ function qsUserRouteExtra pDesc
    return tOut
 end qsUserRouteExtra
 
--- Serve a matched user route: a canned body or a redirect, transport-neutral. Both go
--- through the (keep-alive-aware) text sender with the route's sanitised extra headers.
-command qsUserRouteServe pConn, pDesc, pRequest
-   local tKind, tId, tExtra, tStatus, tCrlf
+-- Guarded entry point (mirrors qsHttpDispatch): a throw inside a user route becomes a clean
+-- 500 rather than a hung stream / aborted keep-alive connection.
+command qsUserRouteDispatch pConn, pDesc, pRequest, pRoot
+   local tErr
+   try
+      qsUserRouteServe pConn, pDesc, pRequest, pRoot
+   catch tErr
+      qsHttpReply pConn, 500, "text/plain; charset=utf-8", "Route error."
+   end try
+end qsUserRouteDispatch
+
+-- Serve a matched user route, transport-neutral: a redirect, a file from the folder
+-- (Range-aware, confined by qsEditSafePath), or a canned body (optionally templated). Body
+-- and redirect go through the keep-alive-aware text sender with the route's sanitised
+-- extra headers; a file goes through the streaming file server with a type override.
+command qsUserRouteServe pConn, pDesc, pRequest, pRoot
+   local tKind, tId, tExtra, tStatus, tCrlf, tBody, tDisk
    put (numToChar(13) & numToChar(10)) into tCrlf
    put char 1 to 2 of pConn into tKind         -- "ox" or "cw"
    put char 4 to -1 of pConn into tId
@@ -4095,13 +4158,85 @@ command qsUserRouteServe pConn, pDesc, pRequest
       end if
       exit qsUserRouteServe
    end if
+   if pDesc["kind"] is "file" then
+      put qsEditSafePath(pRoot, pDesc["file"]) into tDisk    -- confine to the shared folder
+      if tDisk is empty or there is no file tDisk then
+         qsHttpReply pConn, 404, "text/plain; charset=utf-8", "Not found."
+         exit qsUserRouteServe
+      end if
+      if tKind is "ox" then
+         qsFsServeFile tId, tDisk, tDisk, pRequest, pDesc["ctype"], tExtra
+      else
+         qsCwServeFile tId, tDisk, tDisk, pRequest, pDesc["ctype"], tExtra
+      end if
+      exit qsUserRouteServe
+   end if
+   put pDesc["body"] into tBody
+   if pDesc["template"] is "true" then
+      put qsRenderTemplate(tBody, pRequest, pDesc["ctype"]) into tBody
+   end if
    put pDesc["status"] & space & qsHttpReason(pDesc["status"]) into tStatus
    if tKind is "ox" then
-      qsFsSendText tId, tStatus, pDesc["ctype"], pDesc["body"], tExtra
+      qsFsSendText tId, tStatus, pDesc["ctype"], tBody, tExtra
    else
-      qsCwSendText tId, tStatus, pDesc["ctype"], pDesc["body"], tExtra
+      qsCwSendText tId, tStatus, pDesc["ctype"], tBody, tExtra
    end if
 end qsUserRouteServe
+
+-- Substitute {{...}} tokens in a route body with request context, ESCAPED for the response
+-- content-type (JSON-escape for a json type, HTML-escape for html, else control-stripped) so
+-- a reflected value can never break the response. No code runs. The method/path/query tokens
+-- are pure and mirrored by render_template() in the golden; {{now}}/{{date}} read the clock.
+function qsRenderTemplate pText, pRequest, pCtype
+   local tOut, tRest, tOpen, tClose, tTok
+   put "" into tOut
+   put pText into tRest
+   repeat
+      put offset("{{", tRest) into tOpen
+      if tOpen is 0 then
+         put tRest after tOut
+         exit repeat
+      end if
+      put char 1 to (tOpen - 1) of tRest after tOut       -- literal text before the token
+      put char (tOpen + 2) to -1 of tRest into tRest
+      put offset("}}", tRest) into tClose
+      if tClose is 0 then
+         put "{{" & tRest after tOut                       -- unterminated: emit literally
+         exit repeat
+      end if
+      put char 1 to (tClose - 1) of tRest into tTok
+      put char (tClose + 2) to -1 of tRest into tRest
+      put qsTemplateEscape(qsTemplateValue(qsTrim(tTok), pRequest), pCtype) after tOut
+   end repeat
+   return tOut
+end qsRenderTemplate
+
+-- Resolve one template token to its (unescaped) value. Unknown tokens resolve to empty.
+function qsTemplateValue pTok, pRequest
+   if pTok is "method" then
+      return pRequest["__method"]
+   else if pTok is "path" then
+      return pRequest["__path"]
+   else if pTok is "now" then
+      return the seconds
+   else if pTok is "date" then
+      return qsHttpDate(the seconds)
+   else if pTok begins with "query." then
+      return qsQueryParam(pRequest["__query"], char 7 to -1 of pTok)
+   end if
+   return ""
+end qsTemplateValue
+
+-- Escape a substituted value for the response body's content-type. Pure; golden: it is the
+-- security core of templating (a reflected query value must never inject JSON/HTML/controls).
+function qsTemplateEscape pVal, pCtype
+   if pCtype contains "json" then
+      return qsJsonEscape(pVal)
+   else if pCtype contains "html" then
+      return qsFsHtmlEscape(pVal)
+   end if
+   return qsSanitizeHeaderValue(pVal)          -- plain/other: strip control bytes
+end qsTemplateEscape
 
 -- ============================================================================
 -- THE LIVE WEB EDITOR (Phase C). LAN-ONLY, password-gated, OFF by default. See the
@@ -4661,10 +4796,11 @@ command qsFsServePath pStream, pHeaders
       qsHttpDispatch ("ox:" & pStream), sHttpRoutes[tRouteKey], pHeaders
       exit qsFsServePath
    end if
-   -- then a user-declared route from the shared folder's .qsroutes.json
-   qsEnsureUserRoutes qsShareRoot()
-   if sUserRoutes[tRouteKey] is an array then
-      qsUserRouteServe ("ox:" & pStream), sUserRoutes[tRouteKey], pHeaders
+   -- then a user-declared route from the shared folder's .qsroutes.json (use the Tor share's
+   -- OWN root, not qsShareRoot(), which would pick a concurrent clearweb share's folder)
+   qsEnsureUserRoutes sActiveShare["root"]
+   if sUserRoutes[sActiveShare["root"]][tRouteKey] is an array then
+      qsUserRouteDispatch ("ox:" & pStream), sUserRoutes[sActiveShare["root"]][tRouteKey], pHeaders, sActiveShare["root"]
       exit qsFsServePath
    end if
    if tMethod is "OPTIONS" then
@@ -4783,7 +4919,9 @@ end qsAccessLog
 
 -- Serve a file: size it, honour a Range, write the HTTP head, then arm the pump. The
 -- file is NEVER read whole into memory.
-command qsFsServeFile pStream, pDisk, pForMime, pHeaders
+-- pTypeOverride/pExtra (optional): a Content-Type override and extra CRLF-terminated header
+-- lines, used by user "file" routes. Existing 4-arg callers leave both empty (no change).
+command qsFsServeFile pStream, pDisk, pForMime, pHeaders, pTypeOverride, pExtra
    local tSize, tRange, tStart, tEnd, tLen, tStatus, tHead, tCrlf, tType, tSavedID
    put qsFileSize(pDisk) into tSize
    if tSize is empty then
@@ -4792,6 +4930,9 @@ command qsFsServeFile pStream, pDisk, pForMime, pHeaders
    end if
    put (numToChar(13) & numToChar(10)) into tCrlf
    put qsFsMime(pForMime) into tType
+   if pTypeOverride is not empty then
+      put pTypeOverride into tType
+   end if
    put qsFsParseRange(pHeaders["range"], tSize) into tRange
    if tRange is "unsatisfiable" then
       put ("HTTP/1.1 416 Range Not Satisfiable" & tCrlf & "Content-Range: bytes */" & tSize & tCrlf & \
@@ -4820,6 +4961,7 @@ command qsFsServeFile pStream, pDisk, pForMime, pHeaders
       put ("Content-Range: bytes " & tStart & "-" & tEnd & "/" & tSize & tCrlf) after tHead
    end if
    put qsHttpExtraHeaders() after tHead
+   put pExtra after tHead
    put qsHttpDisposition(pForMime, pHeaders) after tHead
    put ("Connection: close" & tCrlf & tCrlf) after tHead
    oxWrite pStream, textEncode(tHead, "UTF-8")
@@ -5499,6 +5641,8 @@ command qsStopClearweb
    put "false" into sCwActive
    put 0 into sCwMapId
    put empty into sCwToken
+   delete variable sUserRoutes[sCwRoot]         -- custom routes reload if this folder is re-shared
+   delete variable sUserRoutesLoaded[sCwRoot]
    put empty into sCwRoot
    put empty into sCwFilePath
    -- clear the left-panel link only if it still shows THIS web share: a code share
@@ -5633,8 +5777,8 @@ command qsCwServe pSocketID
    end if
    -- then a user-declared route from the shared folder's .qsroutes.json
    qsEnsureUserRoutes sCwRoot
-   if sUserRoutes[tRouteKey] is an array then
-      qsUserRouteServe ("cw:" & pSocketID), sUserRoutes[tRouteKey], tHeaders
+   if sUserRoutes[sCwRoot][tRouteKey] is an array then
+      qsUserRouteDispatch ("cw:" & pSocketID), sUserRoutes[sCwRoot][tRouteKey], tHeaders, sCwRoot
       exit qsCwServe
    end if
    if tMethod is "OPTIONS" then
@@ -5692,7 +5836,9 @@ end qsCwServe
 
 -- Serve a file over the socket: size it, honour a Range, write the head, then pump the
 -- body. The file is opened/seeked/read/closed within each pump tick (concurrency-safe).
-command qsCwServeFile pSocketID, pDisk, pForMime, pHeaders
+-- pTypeOverride/pExtra (optional): a Content-Type override and extra CRLF-terminated header
+-- lines, used by user "file" routes. Existing 4-arg callers leave both empty (no change).
+command qsCwServeFile pSocketID, pDisk, pForMime, pHeaders, pTypeOverride, pExtra
    local tSize, tRange, tStart, tEnd, tLen, tStatus, tHead, tCrlf, tType, tSavedID
    put qsFileSize(pDisk) into tSize
    if tSize is empty then
@@ -5701,6 +5847,9 @@ command qsCwServeFile pSocketID, pDisk, pForMime, pHeaders
    end if
    put (numToChar(13) & numToChar(10)) into tCrlf
    put qsFsMime(pForMime) into tType
+   if pTypeOverride is not empty then
+      put pTypeOverride into tType
+   end if
    put qsFsParseRange(pHeaders["range"], tSize) into tRange
    if tRange is "unsatisfiable" then
       qsCwWriteClose pSocketID, textEncode(("HTTP/1.1 416 Range Not Satisfiable" & tCrlf & \
@@ -5727,6 +5876,7 @@ command qsCwServeFile pSocketID, pDisk, pForMime, pHeaders
       put ("Content-Range: bytes " & tStart & "-" & tEnd & "/" & tSize & tCrlf) after tHead
    end if
    put qsHttpExtraHeaders() after tHead
+   put pExtra after tHead
    put qsHttpDisposition(pForMime, pHeaders) after tHead
    put ("Connection: close" & tCrlf & tCrlf) after tHead
    write textEncode(tHead, "UTF-8") to socket pSocketID

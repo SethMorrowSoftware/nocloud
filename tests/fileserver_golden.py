@@ -566,6 +566,52 @@ def sanitize_header_name(n):
     return out
 
 
+# ---- render_template: {{...}} substitution in a route body (templating's security core) ----
+# Mirrors qsRenderTemplate + qsTemplateValue + qsTemplateEscape. A route body may reflect
+# request context ({{method}}/{{path}}/{{query.NAME}}); each value is ESCAPED for the body's
+# content-type (JSON-escape for a json type, HTML-escape for html, else control-stripped) so a
+# reflected query value can NEVER break the response (inject JSON/HTML/a header/control bytes).
+# No code runs. ({{now}}/{{date}} read the clock, so they are not pinned here - they resolve to
+# empty in this pure mirror; only the deterministic tokens + the escaping are golden-checked.)
+
+def template_value(tok, req):
+    if tok == "method":
+        return req.get("__method", "")
+    if tok == "path":
+        return req.get("__path", "")
+    if tok.startswith("query."):
+        return query_param(req.get("__query", ""), tok[6:])
+    return ""                       # unknown (incl. clock tokens now/date) -> empty here
+
+
+def template_escape(val, ctype):
+    if "json" in ctype:
+        return json_escape(val)
+    if "html" in ctype:
+        return html_escape(val)
+    return sanitize_header_value(val)     # plain/other: strip control bytes
+
+
+def render_template(text, req, ctype):
+    out = ""
+    rest = text
+    while True:
+        o = rest.find("{{")
+        if o < 0:
+            out += rest
+            break
+        out += rest[:o]                   # literal text before the token
+        rest = rest[o + 2:]
+        c = rest.find("}}")
+        if c < 0:
+            out += "{{" + rest            # unterminated -> emit literally
+            break
+        tok = rest[:c]
+        rest = rest[c + 2:]
+        out += template_escape(template_value(tok.strip(), req), ctype)
+    return out
+
+
 def main():
     total = 1000
     # -- byte-range parsing --
@@ -930,6 +976,32 @@ def main():
     ]:
         check("sanitize_header_name(%r)" % name, sanitize_header_name(name), want)
 
+    # -- template rendering ({{...}} reflected request context, escaped per content-type) --
+    # raw = the URL-decoded query value '"<b>"' (a quote, <b>, a quote) - the adversarial input.
+    _treq = {"__method": "GET", "__path": "/api/echo",
+             "__query": "name=world&raw=%22%3Cb%3E%22"}
+    _json_ct = "application/json; charset=utf-8"
+    _html_ct = "text/html; charset=utf-8"
+    _text_ct = "text/plain; charset=utf-8"
+    for text, ctype, want in [
+        ("no tokens here", _json_ct, "no tokens here"),
+        ("{{method}}", _json_ct, "GET"),
+        ("path={{path}}", _text_ct, "path=/api/echo"),
+        ("{{ method }}", _json_ct, "GET"),               # surrounding space is trimmed
+        ("{{query.name}}", _text_ct, "world"),
+        ("{{unknown}}", _json_ct, ""),                   # unknown token -> empty
+        ("{{now}}", _json_ct, ""),                       # clock token -> empty in this mirror
+        ("a {{method}} b {{path}} c", _text_ct, "a GET b /api/echo c"),   # multiple tokens
+        ("{{oops", _json_ct, "{{oops"),                  # unterminated -> emitted literally
+        ("x {{oops y", _text_ct, "x {{oops y"),
+        # -- the security core: a reflected value can NEVER break out of the body --
+        ('{"q":"{{query.raw}}"}', _json_ct, '{"q":"\\"<b>\\""}'),   # json: quotes escaped
+        ("<p>{{query.raw}}</p>", _html_ct, "<p>&quot;&lt;b&gt;&quot;</p>"),  # html: <>" escaped
+        ("v={{query.raw}}", _text_ct, 'v="<b>"'),        # plain: printable kept, no controls
+    ]:
+        check("render_template(%r,%s)" % (text, ctype.split(";")[0]),
+              render_template(text, _treq, ctype), want)
+
     if _fail:
         print("fileserver_golden: FAIL\n" + "\n".join(_fail))
         return 1
@@ -937,7 +1009,8 @@ def main():
           "HTML escape, capability gate, SPA fallback, HTTP framing, keep-alive req "
           "length, JSON escape, editor confinement, LAN-first gate, query parse, size "
           "probe, filename sanitise, rate + ETA format, HTTP-date, Allow header, "
-          "editor login backoff, user-route path + header sanitise all match)")
+          "editor login backoff, user-route path + header sanitise, template render + "
+          "escape all match)")
     return 0
 
 

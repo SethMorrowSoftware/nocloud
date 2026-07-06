@@ -4,9 +4,12 @@ You can add your own HTTP endpoints to a shared folder **without opening the sta
 Drop a file named **`.qsroutes.json`** in the folder you share, declare your routes in it, and
 No Cloud Quick Share serves them alongside your static files.
 
-It is **declarative and safe by design**: a route can only return a **canned body** or a
-**redirect** — no code runs. Paths under `/_qs/` and `/_edit/` are reserved, header values are
-sanitised, and the `.qsroutes.json` file itself is never served or listed (it is a dotfile).
+It is **declarative and safe by design**: a route can only return a **canned body**, a **file
+from the shared folder**, or a **redirect** — no code runs. A body may reflect a few request
+values with `{{...}}` placeholders, but every value is **escaped for the response type**, so a
+visitor can never inject markup, JSON, or a header. Paths under `/_qs/` and `/_edit/` are
+reserved, header values are sanitised, file routes are confined to the shared folder, and the
+`.qsroutes.json` file itself is never served or listed (it is a dotfile).
 
 > Requires the engine's JSON support. Custom routes are **fail-closed**: if the build has no
 > JSON decoder, the feature is simply off and everything else works. When you build a
@@ -36,6 +39,20 @@ sanitised, and the `.qsroutes.json` file itself is never served or listed (it is
     },
     {
       "method": "GET",
+      "path": "/api/echo",
+      "type": "application/json; charset=utf-8",
+      "template": true,
+      "body": "{\"method\":\"{{method}}\",\"you_said\":\"{{query.msg}}\"}",
+      "cors": true
+    },
+    {
+      "method": "GET",
+      "path": "/api/config",
+      "file": "config.json",
+      "type": "application/json; charset=utf-8"
+    },
+    {
+      "method": "GET",
       "path": "/go/gallery",
       "redirect": "/gallery",
       "status": 302
@@ -45,7 +62,9 @@ sanitised, and the `.qsroutes.json` file itself is never served or listed (it is
 ```
 
 Now `GET /api/hello` (at the onion root over Tor, or under `/<token>/` over a web link)
-returns your JSON with an `Access-Control-Allow-Origin: *` header, and `/go/gallery` redirects.
+returns your JSON with an `Access-Control-Allow-Origin: *` header; `GET /api/echo?msg=hi`
+reflects that back as `{"method":"GET","you_said":"hi"}`; `GET /api/config` streams
+`config.json` from the folder under a friendlier URL; and `/go/gallery` redirects.
 
 ## Route fields
 
@@ -54,18 +73,40 @@ returns your JSON with an `Access-Control-Allow-Origin: *` header, and `/go/gall
 | `method` | HTTP method to match (`GET`, `POST`, …) | `GET` |
 | `path` | The URL path. Must start with `/`; may not contain `..` or control bytes; may not be under the reserved `/_qs/` or `/_edit/`. | *(required)* |
 | `body` | The response body (any text). Capped at 64 KB. | `""` |
-| `type` | `Content-Type` for a body response. | `text/plain; charset=utf-8` |
+| `template` | `true` enables `{{...}}` substitution in `body` (see below). Values are escaped for `type`. | `false` |
+| `file` | Serve this file (path **relative to the shared folder**) instead of an inline `body`. Range-aware and streamed; confined to the folder just like a static file. | — |
+| `type` | `Content-Type` for a `body` or `file` response. For a file, omit to derive it from the extension. | `text/plain; charset=utf-8` |
 | `status` | HTTP status code. | `200` (body) / `302` (redirect) |
 | `redirect` | If present, the route becomes a redirect to this `Location`. `status` may be `301/302/303/307/308`. | — |
 | `cors` | `true` adds `Access-Control-Allow-Origin: *` (so other pages/tools may fetch it). | `false` |
-| `headers` | An object of extra response headers. Names are limited to letters/digits/`-`; CR/LF/control bytes are stripped from values. | — |
+| `headers` | An object of extra response headers. Names are limited to letters/digits/`-`; CR/LF/control bytes are stripped from values; framing/server-owned headers (`Content-Length`, `Connection`, `Content-Type`, `Location`, `Date`, …) can't be overridden. | — |
+
+A route needs exactly one of `body` (default), `file`, or `redirect`; if more than one is
+present the precedence is `redirect` > `file` > `body`.
+
+## Template placeholders (`{{...}}`)
+
+Set `"template": true` and a `body` can reflect a little request context. Each placeholder is
+replaced with its value **escaped for the response `type`** (JSON-escaped for a `json` type,
+HTML-escaped for an `html` type, otherwise control-stripped) — so a visitor-supplied value can
+never break your JSON, inject HTML, or split a header. Unknown placeholders become empty.
+
+| Placeholder | Becomes |
+|---|---|
+| `{{method}}` | The request method (`GET`, `POST`, …) |
+| `{{path}}` | The request path |
+| `{{query.NAME}}` | The `NAME` query-string parameter (URL-decoded), e.g. `{{query.msg}}` |
+| `{{now}}` | Current time in whole seconds (Unix epoch) |
+| `{{date}}` | Current time as an HTTP-date (`Sun, 06 Jul 2026 12:00:00 GMT`) |
+
+There is still **no scripting** — templating only substitutes these fixed, escaped values.
 
 ## Good to know
 
-- **What it's for:** mock/JSON APIs, config endpoints, CORS-enabled data, redirects and
-  short-links — anything a *canned* response covers. There is no scripting; for genuinely
-  dynamic logic the stack still offers `qsHttpRoute "GET","/api/thing","myHandler"` →
-  `qsHttpReply` inside the script.
+- **What it's for:** mock/JSON APIs, config endpoints, CORS-enabled data, files under friendlier
+  URLs, tiny reflected/echo endpoints, redirects and short-links — anything a *canned* or
+  *file-backed* response covers. For genuinely dynamic logic the stack still offers
+  `qsHttpRoute "GET","/api/thing","myHandler"` → `qsHttpReply` inside the script.
 - **Reserved:** paths under `/_qs/` (the host's own info/transparency routes) and `/_edit/`
   (the LAN editor) can never be overridden, and an invalid route is skipped, not fatal.
 - **Reload:** the file is read when you start sharing the folder. If you edit it while

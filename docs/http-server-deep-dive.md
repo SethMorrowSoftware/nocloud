@@ -9,8 +9,11 @@
 > `Date` header; MIME top-ups; `OPTIONS`/`Allow` + `429`; editor-login throttle; richer
 > `/_qs/info` (+`version`,+`spa`); new `/_qs/transparency`; and **user-defined API routes via
 > `.qsroutes.json`** — a declarative, no-LiveCode way for end-users to add endpoints, gated
-> by a fail-closed JSON probe (see `user-routes.md`). Still open: conditional GET (`ETag`/`304`),
-> a shared clearweb/Tor serve core, first-class route streaming/params, and `file`-mapped routes.
+> by a fail-closed JSON probe (see `user-routes.md`). Those routes now also cover **`file`-mapped
+> responses** (stream a folder file under a friendlier URL, Range-aware, folder-confined) and
+> **safe `{{...}}` body templating** (reflect `method`/`path`/`query.NAME`/`now`/`date`, each
+> escaped for the response type). Still open: conditional GET (`ETag`/`304`), a shared
+> clearweb/Tor serve core, and first-class per-route streaming/params.
 
 ---
 

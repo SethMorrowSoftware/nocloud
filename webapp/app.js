@@ -648,14 +648,16 @@
       '<div class="card"><span class="kicker">Backend &middot; your own routes</span>' +
       '<h2>Add API endpoints with a JSON file</h2>' +
       '<p class="muted">No LiveCode required: drop a <kbd>.qsroutes.json</kbd> in the shared folder and ' +
-      'the host serves the routes you declare. This demo ships one; the call below hits ' +
-      '<kbd>GET /api/hello</kbd>, defined entirely in that file.</p>' +
+      'the host serves the routes you declare &mdash; canned JSON, a file under a friendlier URL, or a ' +
+      'redirect. This demo ships a few; the call below hits <kbd>GET /api/echo</kbd>, which reflects a ' +
+      'query value back through a safe <kbd>{{&hellip;}}</kbd> template (escaped for you, still no code).</p>' +
       '<div class="term"><div class="term-bar"><span class="term-dots"></span>' +
-        '<span class="term-title">GET /api/hello &middot; from .qsroutes.json</span>' +
+        '<span class="term-title">GET /api/echo?msg=&hellip; &middot; from .qsroutes.json</span>' +
         '<span class="term-status" id="usrstat"></span></div>' +
         '<pre class="code" id="usrout">(calling&hellip;)</pre></div>' +
-      '<p class="muted note">Each route returns a canned body or a redirect (no code runs); paths under ' +
-      '<kbd>/_qs/</kbd> and <kbd>/_edit/</kbd> are reserved. For dynamic logic, the stack still offers ' +
+      '<p class="muted note">A route returns a canned body, a file, or a redirect &mdash; no code runs, ' +
+      'reflected values are escaped, and paths under <kbd>/_qs/</kbd> and <kbd>/_edit/</kbd> are reserved. ' +
+      'For dynamic logic, the stack still offers ' +
       '<kbd>qsHttpRoute "GET","/api/thing","myHandler"</kbd> &rarr; <kbd>qsHttpReply</kbd>.</p></div>';
   }
   // The response headers worth surfacing (readable same-origin), in display order.
@@ -720,7 +722,7 @@
     function userRoute() {
       if (!usrOut) return;
       usrStat.className = 'term-status'; usrStat.textContent = 'requesting...';
-      fetch(href('api/hello')).then(function (r) {
+      fetch(href('api/echo?msg=hello%20from%20the%20browser')).then(function (r) {
         if (!r.ok) throw new Error('HTTP ' + r.status);
         return r.text().then(function (txt) {
           var pretty = txt; try { pretty = JSON.stringify(JSON.parse(txt), null, 2); } catch (e) {}
