@@ -1058,6 +1058,7 @@ command qsStart
    put empty into sHttpRoutes
    qsHttpRoute "GET", "/_qs/info", "qsInfoRoute"
    qsHttpRoute "GET", "/_qs/transparency", "qsTransparencyRoute"
+   qsHttpRoute "GET", "/_qs/routes", "qsRoutesRoute"
    -- the live web editor (Phase C). Always registered, but every handler refuses unless
    -- the editor is enabled AND the caller is LAN-local (see qsEditReachable), so these
    -- routes are invisible (404) to Tor and to public clearweb visitors.
@@ -3893,6 +3894,43 @@ command qsTransparencyRoute pConn, pRequest
    qsHttpReply pConn, 200, "application/json; charset=utf-8", tJson
 end qsTransparencyRoute
 
+-- GET /_qs/routes : a read-only listing of the custom routes the served folder declared in its
+-- .qsroutes.json (method + path + kind only - never the file target, the redirect Location, or
+-- the disk root), so a client/demo can SHOW what a dropped-in config produced. Transport-correct
+-- by design: it reads the connection tag (ox:/cw:) to pick THIS share's root, so a Tor visitor
+-- and a concurrent clearweb share never see each other's routes. Loads lazily (qsEnsureUserRoutes)
+-- exactly like the serve paths, so it reflects what a real request would match.
+command qsRoutesRoute pConn, pRequest
+   local tKind, tRoot, tKey, tDesc, tQ, tItems, tCount, tMethod, tPath, tJson
+   put char 1 to 2 of pConn into tKind          -- "ox" (Tor) or "cw" (clearweb)
+   if tKind is "ox" then
+      put sActiveShare["root"] into tRoot
+   else
+      put sCwRoot into tRoot
+   end if
+   put quote into tQ
+   put "" into tItems
+   put 0 into tCount
+   if tRoot is not empty then
+      qsEnsureUserRoutes tRoot                   -- same lazy load the serve paths use
+      repeat for each key tKey in sUserRoutes[tRoot]
+         put sUserRoutes[tRoot][tKey] into tDesc
+         put word 1 of tKey into tMethod         -- keys are "METHOD /path" (space-joined)
+         put word 2 to -1 of tKey into tPath
+         if tItems is not empty then
+            put "," after tItems
+         end if
+         put "{" & tQ & "method" & tQ & ":" & tQ & qsJsonEscape(tMethod) & tQ & "," & \
+            tQ & "path" & tQ & ":" & tQ & qsJsonEscape(tPath) & tQ & "," & \
+            tQ & "kind" & tQ & ":" & tQ & qsJsonEscape(tDesc["kind"]) & tQ & "}" after tItems
+         add 1 to tCount
+      end repeat
+   end if
+   put "{" & tQ & "count" & tQ & ":" & tCount & "," & \
+      tQ & "routes" & tQ & ":[" & tItems & "]}" into tJson
+   qsHttpReply pConn, 200, "application/json; charset=utf-8", tJson
+end qsRoutesRoute
+
 -- ============================================================================
 -- USER-DEFINED API ROUTES (.qsroutes.json). Let someone who never opens the stack add
 -- endpoints by dropping a JSON file in the shared folder. Declarative + SAFE: a route can
@@ -4867,11 +4905,17 @@ end qsFsServePath
 -- Response headers added to EVERYTHING we serve (both transports), as CRLF-terminated
 -- lines: identify the server, forbid MIME sniffing (safer when hosting untrusted-looking
 -- files), and - because the folder can be edited live - tell the browser to revalidate
--- rather than serve a stale cached copy. Two privacy/safety headers ride along for an app
--- whose whole point is not leaking: `Referrer-Policy: no-referrer` (a page served here never
--- leaks its own URL - a Tor .onion or a capability-token web link - to anywhere it links out
--- to), and `X-Frame-Options: DENY` (the page cannot be framed, so it cannot be clickjacked;
--- these pages are meant to be visited directly, never embedded).
+-- rather than serve a stale cached copy. Four privacy/safety headers ride along for an app
+-- whose whole point is not leaking:
+--   * Referrer-Policy: no-referrer  - a page served here never leaks its own URL (a Tor .onion
+--       address or a capability-token web link) to anywhere it links out to.
+--   * X-Frame-Options: DENY         - the page cannot be framed, so it cannot be clickjacked;
+--       these pages are meant to be visited directly, never embedded.
+--   * X-Robots-Tag: noindex, nofollow - a temporary share link is not for search engines; keep
+--       it out of the index (a deliberate default for a share tool - flip it if you host a
+--       public site over a web link and WANT it crawled).
+--   * Permissions-Policy: browsing-topics=() - opt every response out of the browser's ad-topics
+--       (FLoC successor) sampling; nothing here needs it, and a no-cloud app should not feed it.
 function qsHttpExtraHeaders
    local tCrlf, tDate, tOut
    put (numToChar(13) & numToChar(10)) into tCrlf
@@ -4884,6 +4928,7 @@ function qsHttpExtraHeaders
    end if
    put "X-Content-Type-Options: nosniff" & tCrlf & "Cache-Control: no-cache" & tCrlf after tOut
    put "Referrer-Policy: no-referrer" & tCrlf & "X-Frame-Options: DENY" & tCrlf after tOut
+   put "X-Robots-Tag: noindex, nofollow" & tCrlf & "Permissions-Policy: browsing-topics=()" & tCrlf after tOut
    return tOut
 end qsHttpExtraHeaders
 

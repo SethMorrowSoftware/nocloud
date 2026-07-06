@@ -12,8 +12,11 @@
 > by a fail-closed JSON probe (see `user-routes.md`). Those routes now also cover **`file`-mapped
 > responses** (stream a folder file under a friendlier URL, Range-aware, folder-confined) and
 > **safe `{{...}}` body templating** (reflect `method`/`path`/`query.NAME`/`now`/`date`, each
-> escaped for the response type). Still open: conditional GET (`ETag`/`304`), a shared
-> clearweb/Tor serve core, and first-class per-route streaming/params.
+> escaped for the response type). Also landed: **privacy/safety response headers** on every
+> response (`Referrer-Policy: no-referrer`, `X-Frame-Options: DENY`, `X-Robots-Tag: noindex`,
+> `Permissions-Policy: browsing-topics=()`) and a read-only **`GET /_qs/routes`** listing the
+> active custom routes (method/path/kind only). Still open: conditional GET (`ETag`/`304`), a
+> shared clearweb/Tor serve core, and first-class per-route streaming/params.
 
 ---
 
