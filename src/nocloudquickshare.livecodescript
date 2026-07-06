@@ -3821,6 +3821,32 @@ function qsHttpAllow pPath, pRoot
    return tOut
 end qsHttpAllow
 
+-- The CORS preflight header block for an OPTIONS to pPath, or empty if no user route on pPath
+-- opted into `cors`. A route with "cors": true already stamps Access-Control-Allow-Origin: * on
+-- its OWN response (a simple cross-origin GET just works); this closes the gap for a PREFLIGHTED
+-- request (POST+JSON, PUT/DELETE, custom headers), where the browser sends OPTIONS first and
+-- expects the Allow-* headers back or it aborts the real request. pAllow is the already-computed
+-- Allow value (the methods this path accepts), reused verbatim for Allow-Methods. Origin is "*"
+-- (never credentialed here), so Allow-Headers: * is valid. Pure over sUserRoutes; golden: cors_*.
+function qsCorsPreflight pRoot, pPath, pAllow
+   local tKey, tSp, tRoutePath, tCrlf
+   if pRoot is empty then
+      return ""
+   end if
+   put (numToChar(13) & numToChar(10)) into tCrlf
+   repeat for each key tKey in sUserRoutes[pRoot]
+      put offset(space, tKey) into tSp
+      if tSp >= 1 and (char (tSp + 1) to -1 of tKey) is pPath \
+            and sUserRoutes[pRoot][tKey]["cors"] is "true" then
+         return "Access-Control-Allow-Origin: *" & tCrlf & \
+            "Access-Control-Allow-Methods: " & pAllow & tCrlf & \
+            "Access-Control-Allow-Headers: *" & tCrlf & \
+            "Access-Control-Max-Age: 600" & tCrlf
+      end if
+   end repeat
+   return ""
+end qsCorsPreflight
+
 -- Escape a string for a JSON value (backslash FIRST, then the rest).
 function qsJsonEscape pText
    local tOut, tBack
@@ -4141,6 +4167,7 @@ command qsLoadUserRoutes pRoot
          put "" into tHdrs
          if tRoute["cors"] is "true" then
             put "Access-Control-Allow-Origin: *" & return after tHdrs
+            put "true" into tDesc["cors"]        -- also answer the CORS preflight (OPTIONS)
          end if
          if tRoute["headers"] is an array then
             repeat for each key tHkey in tRoute["headers"]
@@ -4835,7 +4862,7 @@ end qsEditHtml
 -- Route: a folder (listing or its index.html, with a trailing-slash redirect), a
 -- file (streamed, Range-aware), else 404. Only GET/HEAD; ".." refused.
 command qsFsServePath pStream, pHeaders
-   local tRaw, tPath, tDisk, tIndex, tMethod, tRoot, tSpa, tRouteKey, tCrlf
+   local tRaw, tPath, tDisk, tIndex, tMethod, tRoot, tSpa, tRouteKey, tCrlf, tAllow
    put (numToChar(13) & numToChar(10)) into tCrlf
    put pHeaders["__method"] into tMethod
    put pHeaders["__path"] into tRaw          -- still %xx-encoded; used for the redirect Location
@@ -4878,7 +4905,9 @@ command qsFsServePath pStream, pHeaders
    if tMethod is "OPTIONS" then
       -- 200 with an empty body (not 204: a 204 must not carry Content-Length, which the
       -- shared text sender always sets). Advertise the methods this path accepts.
-      qsFsSendText pStream, "200 OK", "text/plain; charset=utf-8", "", ("Allow: " & qsHttpAllow(tPath, sActiveShare["root"]) & tCrlf)
+      put qsHttpAllow(tPath, sActiveShare["root"]) into tAllow
+      qsFsSendText pStream, "200 OK", "text/plain; charset=utf-8", "", \
+         ("Allow: " & tAllow & tCrlf & qsCorsPreflight(sActiveShare["root"], tPath, tAllow))
       exit qsFsServePath
    end if
    if tMethod is not "GET" and tMethod is not "HEAD" then
@@ -5800,7 +5829,7 @@ end qsCwData
 -- Parse, check the capability token (the first path segment), then route: for a file
 -- share only the one file is reachable; for a folder share, browse within the root.
 command qsCwServe pSocketID
-   local tHeaders, tMethod, tRaw, tPath, tTok, tRest, tDisk, tIndex, tSavedID, tSpa, tRouteKey, tCrlf
+   local tHeaders, tMethod, tRaw, tPath, tTok, tRest, tDisk, tIndex, tSavedID, tSpa, tRouteKey, tCrlf, tAllow
    put (numToChar(13) & numToChar(10)) into tCrlf
    put qsHttpParse(sCwReq[pSocketID]) into tHeaders
    put tHeaders["__method"] into tMethod
@@ -5868,7 +5897,9 @@ command qsCwServe pSocketID
    if tMethod is "OPTIONS" then
       -- 200 + empty body (not 204: a 204 must not carry the Content-Length the shared
       -- sender always sets); keep-alive stays clean since the body is empty.
-      qsCwSendText pSocketID, "200 OK", "text/plain; charset=utf-8", "", ("Allow: " & qsHttpAllow(tRest, sCwRoot) & tCrlf)
+      put qsHttpAllow(tRest, sCwRoot) into tAllow
+      qsCwSendText pSocketID, "200 OK", "text/plain; charset=utf-8", "", \
+         ("Allow: " & tAllow & tCrlf & qsCorsPreflight(sCwRoot, tRest, tAllow))
       exit qsCwServe
    end if
    if tMethod is not "GET" and tMethod is not "HEAD" then
