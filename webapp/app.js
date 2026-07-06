@@ -644,9 +644,19 @@
         '<span class="term-status" id="optstat"></span></div>' +
         '<pre class="code" id="optout">(calling&hellip;)</pre></div>' +
       '<p class="muted note">Every response carries a <kbd>Date</kbd> and the host answers ' +
-      '<kbd>OPTIONS</kbd> with an <kbd>Allow</kbd> header. Add your own routes with ' +
-      '<kbd>qsHttpRoute "GET","/api/thing","myHandler"</kbd>, replying via <kbd>qsHttpReply</kbd> &mdash; ' +
-      'the Store&rsquo;s checkout page sketches a <kbd>POST /api/order</kbd> the same way.</p></div>';
+      '<kbd>OPTIONS</kbd> with an <kbd>Allow</kbd> header.</p></div>' +
+      '<div class="card"><span class="kicker">Backend &middot; your own routes</span>' +
+      '<h2>Add API endpoints with a JSON file</h2>' +
+      '<p class="muted">No LiveCode required: drop a <kbd>.qsroutes.json</kbd> in the shared folder and ' +
+      'the host serves the routes you declare. This demo ships one; the call below hits ' +
+      '<kbd>GET /api/hello</kbd>, defined entirely in that file.</p>' +
+      '<div class="term"><div class="term-bar"><span class="term-dots"></span>' +
+        '<span class="term-title">GET /api/hello &middot; from .qsroutes.json</span>' +
+        '<span class="term-status" id="usrstat"></span></div>' +
+        '<pre class="code" id="usrout">(calling&hellip;)</pre></div>' +
+      '<p class="muted note">Each route returns a canned body or a redirect (no code runs); paths under ' +
+      '<kbd>/_qs/</kbd> and <kbd>/_edit/</kbd> are reserved. For dynamic logic, the stack still offers ' +
+      '<kbd>qsHttpRoute "GET","/api/thing","myHandler"</kbd> &rarr; <kbd>qsHttpReply</kbd>.</p></div>';
   }
   // The response headers worth surfacing (readable same-origin), in display order.
   var SHOWN_HEADERS = ['server', 'date', 'content-type', 'content-length',
@@ -704,9 +714,31 @@
         optStat.innerHTML = '<span class="no">unavailable here</span>';
       });
     }
-    btn.addEventListener('click', function () { ping(); options(); });
+    // A live call to a user-defined route (declared in .qsroutes.json, not in LiveCode).
+    var usrOut = document.getElementById('usrout');
+    var usrStat = document.getElementById('usrstat');
+    function userRoute() {
+      if (!usrOut) return;
+      usrStat.className = 'term-status'; usrStat.textContent = 'requesting...';
+      fetch(href('api/hello')).then(function (r) {
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        return r.text().then(function (txt) {
+          var pretty = txt; try { pretty = JSON.stringify(JSON.parse(txt), null, 2); } catch (e) {}
+          usrOut.textContent = pretty;
+          usrStat.className = 'term-status live';
+          usrStat.innerHTML = '<span class="dot"></span><span class="ok">' + r.status + '</span>';
+        });
+      }).catch(function (e) {
+        usrOut.textContent = 'This route exists only when the host has read a .qsroutes.json declaring it ' +
+          '(and the engine supports JSON). In a plain static preview there is no host to answer.\n\n' + e;
+        usrStat.className = 'term-status';
+        usrStat.innerHTML = '<span class="no">unavailable here</span>';
+      });
+    }
+    btn.addEventListener('click', function () { ping(); options(); userRoute(); });
     ping();
     options();
+    userRoute();
   }
 
   // -------------------------------------------------------------------- about

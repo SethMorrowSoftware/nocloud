@@ -1,10 +1,16 @@
 # The HTTP Server — Deep Dive, Improvement Ideas, and Endpoint Brainstorm
 
-> **Status:** design/discussion document. **No code here** — suggestions and plans only.
-> Everything below is grounded in a read of `src/nocloudquickshare.livecodescript`
-> (handler names + line numbers cited), `tests/fileserver_golden.py`, and
-> `docs/what-it-hides.md`. Anything that would change runtime behavior is flagged as
-> **needs an OXT pass** (there is no headless way to run a `.livecodescript`).
+> **Status:** design/discussion document grounded in a read of
+> `src/nocloudquickshare.livecodescript` (handler names + line numbers cited),
+> `tests/fileserver_golden.py`, and `docs/what-it-hides.md`. Anything that changes runtime
+> behavior is flagged **needs an OXT pass** (there is no headless way to run a `.livecodescript`).
+>
+> **Implemented since (Phase 0 + follow-ups, both gates green, pending an OXT pass):**
+> `Date` header; MIME top-ups; `OPTIONS`/`Allow` + `429`; editor-login throttle; richer
+> `/_qs/info` (+`version`,+`spa`); new `/_qs/transparency`; and **user-defined API routes via
+> `.qsroutes.json`** — a declarative, no-LiveCode way for end-users to add endpoints, gated
+> by a fail-closed JSON probe (see `user-routes.md`). Still open: conditional GET (`ETag`/`304`),
+> a shared clearweb/Tor serve core, first-class route streaming/params, and `file`-mapped routes.
 
 ---
 

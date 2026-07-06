@@ -534,6 +534,38 @@ def edit_login_wait(fails, last_ms, now_ms):
     return need - elapsed
 
 
+# ---- user-defined API routes (.qsroutes.json) security helpers ---------------
+# A user route path must be absolute, traversal-free, control-free, and NEVER under the
+# reserved /_qs/ or /_edit/ namespaces. Mirrors qsUserPathValid.
+
+def user_path_valid(path):
+    if path == "" or path[:1] != "/":
+        return False
+    if ".." in path:
+        return False
+    if any(ord(c) < 32 for c in path):
+        return False
+    if path == "/_qs" or path.startswith("/_qs/"):
+        return False
+    if path == "/_edit" or path.startswith("/_edit/"):
+        return False
+    return True
+
+
+def sanitize_header_value(v):
+    # drop anything that could break out of one header line (CR/LF/NUL/other controls)
+    return "".join(c for c in v if ord(c) >= 32)
+
+
+def sanitize_header_name(n):
+    out = ""
+    for c in n:
+        o = ord(c)
+        if (48 <= o <= 57) or (65 <= o <= 90) or (97 <= o <= 122) or c == "-":
+            out += c
+    return out
+
+
 def main():
     total = 1000
     # -- byte-range parsing --
@@ -860,6 +892,44 @@ def main():
         check("edit_login_wait(%r,%r,%r)" % (fails, last_ms, now_ms),
               edit_login_wait(fails, last_ms, now_ms), want)
 
+    # -- user-route path validation (reserved namespaces, traversal, controls) --
+    for path, want in [
+        ("/api/hello", True),
+        ("/hello", True),
+        ("/go/docs", True),
+        ("/normal-path_123", True),
+        ("/_qsx", True),                        # not /_qs or /_qs/... -> allowed
+        ("", False),
+        ("api/x", False),                       # must be absolute
+        ("/../etc", False),
+        ("/a/../b", False),
+        ("/_qs", False),                        # reserved (exact)
+        ("/_qs/info", False),                   # reserved (prefix)
+        ("/_edit", False),
+        ("/_edit/login", False),
+        ("/a\nb", False),                       # control byte
+    ]:
+        check("user_path_valid(%r)" % path, user_path_valid(path), want)
+
+    # -- header sanitisation (no CRLF/control injection) --
+    for val, want in [
+        ("value", "value"),
+        ("a\r\nb", "ab"),                       # CR + LF stripped
+        ("a\tb", "ab"),                         # tab (9) stripped
+        ("x\x00y", "xy"),                       # NUL stripped
+        ("keep me", "keep me"),                 # space (32) kept
+    ]:
+        check("sanitize_header_value(%r)" % val, sanitize_header_value(val), want)
+    for name, want in [
+        ("X-Custom", "X-Custom"),
+        ("Content-Type", "Content-Type"),
+        ("bad name", "badname"),                # space dropped
+        ("X:Injection", "XInjection"),          # colon dropped
+        ("a\r\nb", "ab"),
+        ("under_score", "underscore"),          # underscore not a kept token char (strict)
+    ]:
+        check("sanitize_header_name(%r)" % name, sanitize_header_name(name), want)
+
     if _fail:
         print("fileserver_golden: FAIL\n" + "\n".join(_fail))
         return 1
@@ -867,7 +937,7 @@ def main():
           "HTML escape, capability gate, SPA fallback, HTTP framing, keep-alive req "
           "length, JSON escape, editor confinement, LAN-first gate, query parse, size "
           "probe, filename sanitise, rate + ETA format, HTTP-date, Allow header, "
-          "editor login backoff all match)")
+          "editor login backoff, user-route path + header sanitise all match)")
     return 0
 
 

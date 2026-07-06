@@ -59,6 +59,9 @@ local sSession          -- the live session handle (0/empty = none)
 local sPolling          -- "true" while the poll/repaint loops are armed
 local sShareCode        -- the most recent file's share code (plain hash or BTXQS1:)
 local sCanEncrypt       -- "true" if cryptoXT (libsodium) is installed + working
+local sHasJson          -- "true" if the engine can parse JSON (JSONToArray probed once; fail-closed)
+local sUserRoutes       -- array: "METHOD /path" -> a validated route descriptor (from .qsroutes.json)
+local sUserRoutesRoot   -- the folder root sUserRoutes was loaded for (reload when the share changes)
 local sPendingKey       -- array: info-hash -> 32-byte file key, for a download to decrypt
 local sPendingName      -- array: info-hash -> original filename, for that download
 local sXferName         -- array: info-hash -> real name to SHOW locally (swarm sees .enc)
@@ -254,6 +257,10 @@ constant kEditFreeTries = 4            -- editor login: failed attempts allowed 
 constant kEditLockBaseMs = 1000        -- editor login: base backoff after the free tries (doubles/fail)
 constant kEditLockCapMs = 30000        -- editor login: backoff ceiling (30 s)
 constant kEditFailWindowMs = 900000    -- editor login: forget a fail streak after 15 min of quiet
+constant kUserRoutesFile = ".qsroutes.json"  -- per-folder API route config (a dotfile: never served)
+constant kUserRoutesMax = 100          -- cap on user-declared routes from one config (anti-abuse)
+constant kUserRoutesFileMax = 262144   -- cap on the config file we will read (256 KB)
+constant kUserBodyMax = 65536          -- cap on one inline route body (64 KB)
 constant kAnonSizeWarn = 268435456     -- 256 MiB: warn (never block) above this, anon path
 constant kTorSocksPort = "9050"        -- system/standalone tor
 constant kTorControlPort = "9051"
@@ -1032,6 +1039,9 @@ command qsStart
    put "true" into sPolling
    -- probe cryptoXT once so the passphrase fields can fail closed when it is absent
    put qsCanEncrypt() into sCanEncrypt
+   -- probe the engine's JSON decoder once; gates the optional user-defined API routes
+   -- (.qsroutes.json). Absent JSON simply means that one feature is off - fail closed.
+   put qsCanJson() into sHasJson
    -- probe OnionXT and bring up the Tor control link (non-blocking). The anon path
    -- is completely inert when OnionXT/cryptoXT/Tor are absent; nothing else changes.
    put qsHasOnion() into sHasOnion
@@ -1101,6 +1111,8 @@ command qsStop
    end repeat
    put empty into sTempEnc
    put empty into sOnionXfers
+   put empty into sUserRoutes         -- forget custom routes; a re-share reloads .qsroutes.json
+   put empty into sUserRoutesRoot
    -- reset the My Shares bookkeeping too: torrent handle values restart at a fixed
    -- number for a fresh session, so a stale handle->code entry left here would make a
    -- reopened session's first download look like a seed with someone else's code.
@@ -3644,6 +3656,16 @@ function qsHttpReason pCode
       return "Created"
    else if pCode is 204 then
       return "No Content"
+   else if pCode is 301 then
+      return "Moved Permanently"
+   else if pCode is 302 then
+      return "Found"
+   else if pCode is 303 then
+      return "See Other"
+   else if pCode is 307 then
+      return "Temporary Redirect"
+   else if pCode is 308 then
+      return "Permanent Redirect"
    else if pCode is 400 then
       return "Bad Request"
    else if pCode is 401 then
@@ -3865,6 +3887,221 @@ command qsTransparencyRoute pConn, pRequest
       tQ & "ephemeral" & tQ & ":true}" into tJson
    qsHttpReply pConn, 200, "application/json; charset=utf-8", tJson
 end qsTransparencyRoute
+
+-- ============================================================================
+-- USER-DEFINED API ROUTES (.qsroutes.json). Let someone who never opens the stack add
+-- endpoints by dropping a JSON file in the shared folder. Declarative + SAFE: a route can
+-- only return a canned body or a redirect (NO code execution), never under the reserved
+-- /_qs/ or /_edit/ namespaces, headers are CR/LF-sanitised, and the config is a dotfile so
+-- it is never served or listed. Gated by sHasJson (fail-closed: no JSON decoder -> off).
+-- ----------------------------------------------------------------------------
+
+-- Fail-closed probe: can the engine decode JSON? Mirrors qsCanEncrypt (probe once into
+-- sHasJson). Uses JSONToArray, LiveCode/OXT's built-in decoder; a build without it (or a
+-- standalone that did not include the JSON library) just leaves user routes off.
+function qsCanJson
+   local tArr, tErr
+   try
+      put JSONToArray("{" & quote & "k" & quote & ":1}") into tArr
+   catch tErr
+      return false
+   end try
+   return (tArr["k"] is 1)
+end qsCanJson
+
+-- Is a user-declared route path acceptable? Absolute, no traversal, no control bytes, and
+-- NEVER colliding with the reserved server namespaces. Pure; golden: user_path_valid().
+function qsUserPathValid pPath
+   if pPath is empty or char 1 of pPath is not "/" then
+      return false
+   end if
+   if pPath contains ".." then
+      return false
+   end if
+   if qsPathHasControl(pPath) then
+      return false
+   end if
+   if pPath is "/_qs" or pPath begins with "/_qs/" then
+      return false
+   end if
+   if pPath is "/_edit" or pPath begins with "/_edit/" then
+      return false
+   end if
+   return true
+end qsUserPathValid
+
+-- Drop bytes that could break out of one response-header line (CR/LF/NUL/other controls)
+-- from a user-supplied header VALUE. Pure; golden: sanitize_header_value().
+function qsSanitizeHeaderValue pVal
+   local tOut, tCh
+   put "" into tOut
+   repeat for each char tCh in pVal
+      if charToNum(tCh) >= 32 then
+         put tCh after tOut
+      end if
+   end repeat
+   return tOut
+end qsSanitizeHeaderValue
+
+-- Keep only RFC token chars in a user-supplied header NAME (letters, digits, "-"). Pure;
+-- golden: sanitize_header_name().
+function qsSanitizeHeaderName pName
+   local tOut, tCh, tN
+   put "" into tOut
+   repeat for each char tCh in pName
+      put charToNum(tCh) into tN
+      if (tN >= 48 and tN <= 57) or (tN >= 65 and tN <= 90) \
+            or (tN >= 97 and tN <= 122) or tCh is "-" then
+         put tCh after tOut
+      end if
+   end repeat
+   return tOut
+end qsSanitizeHeaderName
+
+-- Reload sUserRoutes only when the served folder changes (a cheap string compare per
+-- request). A no-op unless JSON decoding is available and a folder is being shared.
+command qsEnsureUserRoutes pRoot
+   if pRoot is sUserRoutesRoot then
+      exit qsEnsureUserRoutes
+   end if
+   put pRoot into sUserRoutesRoot
+   put empty into sUserRoutes
+   if not sHasJson or pRoot is empty then
+      exit qsEnsureUserRoutes
+   end if
+   qsLoadUserRoutes pRoot
+end qsEnsureUserRoutes
+
+-- Read + parse + validate <root>/.qsroutes.json into sUserRoutes. Every step is guarded so
+-- a malformed config disables just this feature (never the server). Each route becomes a
+-- descriptor: kind ("body"/"redirect"), status, ctype, body OR location, and a newline-
+-- separated block of already-sanitised extra header lines.
+command qsLoadUserRoutes pRoot
+   local tFile, tText, tData, tList, tI, tRoute, tCount, tErr
+   local tMethod, tPath, tKey, tDesc, tHkey, tHval, tHname, tStat, tHdrs
+   put pRoot & "/" & kUserRoutesFile into tFile
+   if there is no file tFile then
+      exit qsLoadUserRoutes
+   end if
+   put "" into tText
+   open file tFile for binary read
+   if the result is not empty then
+      exit qsLoadUserRoutes
+   end if
+   read from file tFile for kUserRoutesFileMax     -- bounded: this is config, not payload
+   put textDecode(it, "UTF-8") into tText
+   try
+      close file tFile
+   catch tErr
+   end try
+   try
+      put JSONToArray(tText) into tData
+   catch tErr
+      qsLog ("Ignoring " & kUserRoutesFile & ": not valid JSON.")
+      exit qsLoadUserRoutes
+   end try
+   put tData["routes"] into tList
+   put the number of elements of tList into tCount
+   if tCount > kUserRoutesMax then
+      put kUserRoutesMax into tCount
+   end if
+   repeat with tI = 1 to tCount
+      put tList[tI] into tRoute
+      put toUpper(qsTrim(tRoute["method"])) into tMethod
+      if tMethod is empty then
+         put "GET" into tMethod
+      end if
+      put tRoute["path"] into tPath
+      if not qsUserPathValid(tPath) then
+         next repeat
+      end if
+      put empty into tDesc
+      if tRoute["redirect"] is not empty then
+         put "redirect" into tDesc["kind"]
+         put qsSanitizeHeaderValue(tRoute["redirect"]) into tDesc["location"]
+         put tRoute["status"] into tStat
+         if tStat is not among the items of "301,302,303,307,308" then
+            put 302 into tStat
+         end if
+         put tStat into tDesc["status"]
+      else
+         put "body" into tDesc["kind"]
+         put tRoute["body"] into tDesc["body"]
+         if the number of bytes in tDesc["body"] > kUserBodyMax then
+            next repeat                       -- oversized inline body: skip
+         end if
+         if tRoute["type"] is not empty then
+            put qsSanitizeHeaderValue(tRoute["type"]) into tDesc["ctype"]
+         else
+            put "text/plain; charset=utf-8" into tDesc["ctype"]
+         end if
+         put tRoute["status"] into tStat
+         if tStat is not an integer or tStat < 100 or tStat > 599 then
+            put 200 into tStat
+         end if
+         put tStat into tDesc["status"]
+      end if
+      put "" into tHdrs
+      if tRoute["cors"] is "true" then
+         put "Access-Control-Allow-Origin: *" & return after tHdrs
+      end if
+      if tRoute["headers"] is an array then
+         repeat for each key tHkey in tRoute["headers"]
+            put qsSanitizeHeaderName(tHkey) into tHname
+            put qsSanitizeHeaderValue(tRoute["headers"][tHkey]) into tHval
+            if tHname is not empty and tHval is not empty then
+               put tHname & ": " & tHval & return after tHdrs
+            end if
+         end repeat
+      end if
+      put tHdrs into tDesc["headers"]
+      put tMethod & space & tPath into tKey     -- last write wins on a duplicate key
+      put tDesc into sUserRoutes[tKey]
+   end repeat
+   if the number of elements of sUserRoutes > 0 then
+      qsLog ("Loaded " & the number of elements of sUserRoutes & " custom API route(s) from " & kUserRoutesFile & ".")
+   end if
+end qsLoadUserRoutes
+
+-- The CRLF-terminated extra-header block for a user route (its stored newline-separated,
+-- already-sanitised header lines).
+function qsUserRouteExtra pDesc
+   local tCrlf, tLine, tOut
+   put (numToChar(13) & numToChar(10)) into tCrlf
+   put "" into tOut
+   repeat for each line tLine in pDesc["headers"]
+      if tLine is not empty then
+         put tLine & tCrlf after tOut
+      end if
+   end repeat
+   return tOut
+end qsUserRouteExtra
+
+-- Serve a matched user route: a canned body or a redirect, transport-neutral. Both go
+-- through the (keep-alive-aware) text sender with the route's sanitised extra headers.
+command qsUserRouteServe pConn, pDesc, pRequest
+   local tKind, tId, tExtra, tStatus, tCrlf
+   put (numToChar(13) & numToChar(10)) into tCrlf
+   put char 1 to 2 of pConn into tKind         -- "ox" or "cw"
+   put char 4 to -1 of pConn into tId
+   put qsUserRouteExtra(pDesc) into tExtra
+   if pDesc["kind"] is "redirect" then
+      put ("Location: " & pDesc["location"] & tCrlf) & tExtra into tExtra
+      put pDesc["status"] & space & qsHttpReason(pDesc["status"]) into tStatus
+      if tKind is "ox" then
+         qsFsSendText tId, tStatus, "text/plain; charset=utf-8", "", tExtra
+      else
+         qsCwSendText tId, tStatus, "text/plain; charset=utf-8", "", tExtra
+      end if
+      exit qsUserRouteServe
+   end if
+   put pDesc["status"] & space & qsHttpReason(pDesc["status"]) into tStatus
+   if tKind is "ox" then
+      qsFsSendText tId, tStatus, pDesc["ctype"], pDesc["body"], tExtra
+   else
+      qsCwSendText tId, tStatus, pDesc["ctype"], pDesc["body"], tExtra
+   end if
+end qsUserRouteServe
 
 -- ============================================================================
 -- THE LIVE WEB EDITOR (Phase C). LAN-ONLY, password-gated, OFF by default. See the
@@ -4422,6 +4659,12 @@ command qsFsServePath pStream, pHeaders
    if sHttpRoutes[tRouteKey] is not empty then
       put tPath into pHeaders["__path"]
       qsHttpDispatch ("ox:" & pStream), sHttpRoutes[tRouteKey], pHeaders
+      exit qsFsServePath
+   end if
+   -- then a user-declared route from the shared folder's .qsroutes.json
+   qsEnsureUserRoutes qsShareRoot()
+   if sUserRoutes[tRouteKey] is an array then
+      qsUserRouteServe ("ox:" & pStream), sUserRoutes[tRouteKey], pHeaders
       exit qsFsServePath
    end if
    if tMethod is "OPTIONS" then
@@ -5386,6 +5629,12 @@ command qsCwServe pSocketID
    if sHttpRoutes[tRouteKey] is not empty then
       put tRest into tHeaders["__path"]
       qsHttpDispatch ("cw:" & pSocketID), sHttpRoutes[tRouteKey], tHeaders
+      exit qsCwServe
+   end if
+   -- then a user-declared route from the shared folder's .qsroutes.json
+   qsEnsureUserRoutes sCwRoot
+   if sUserRoutes[tRouteKey] is an array then
+      qsUserRouteServe ("cw:" & pSocketID), sUserRoutes[tRouteKey], tHeaders
       exit qsCwServe
    end if
    if tMethod is "OPTIONS" then
