@@ -662,7 +662,8 @@
   }
   // The response headers worth surfacing (readable same-origin), in display order.
   var SHOWN_HEADERS = ['server', 'date', 'content-type', 'content-length',
-    'cache-control', 'accept-ranges', 'x-content-type-options'];
+    'cache-control', 'accept-ranges', 'x-content-type-options',
+    'referrer-policy', 'x-frame-options'];
   function dumpHeaders(r) {
     var lines = [];
     for (var i = 0; i < SHOWN_HEADERS.length; i++) {

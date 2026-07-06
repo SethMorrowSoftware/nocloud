@@ -4867,7 +4867,11 @@ end qsFsServePath
 -- Response headers added to EVERYTHING we serve (both transports), as CRLF-terminated
 -- lines: identify the server, forbid MIME sniffing (safer when hosting untrusted-looking
 -- files), and - because the folder can be edited live - tell the browser to revalidate
--- rather than serve a stale cached copy.
+-- rather than serve a stale cached copy. Two privacy/safety headers ride along for an app
+-- whose whole point is not leaking: `Referrer-Policy: no-referrer` (a page served here never
+-- leaks its own URL - a Tor .onion or a capability-token web link - to anywhere it links out
+-- to), and `X-Frame-Options: DENY` (the page cannot be framed, so it cannot be clickjacked;
+-- these pages are meant to be visited directly, never embedded).
 function qsHttpExtraHeaders
    local tCrlf, tDate, tOut
    put (numToChar(13) & numToChar(10)) into tCrlf
@@ -4879,6 +4883,7 @@ function qsHttpExtraHeaders
       put "Date: " & tDate & tCrlf after tOut
    end if
    put "X-Content-Type-Options: nosniff" & tCrlf & "Cache-Control: no-cache" & tCrlf after tOut
+   put "Referrer-Policy: no-referrer" & tCrlf & "X-Frame-Options: DENY" & tCrlf after tOut
    return tOut
 end qsHttpExtraHeaders
 
