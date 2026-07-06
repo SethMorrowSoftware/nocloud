@@ -27,6 +27,7 @@ Mirrors these LiveCodeScript handlers:
     python3 tests/fileserver_golden.py     # exit 0 = OK, 1 = mismatch
 """
 import sys
+from email.utils import formatdate
 from urllib.parse import unquote, unquote_plus
 
 _fail = []
@@ -137,6 +138,14 @@ _MIME = {
     "woff": "font/woff", "woff2": "font/woff2", "ttf": "font/ttf", "otf": "font/otf",
     "eot": "application/vnd.ms-fontobject", "avif": "image/avif",
     "csv": "text/csv; charset=utf-8",
+    # extended media / data types
+    "flac": "audio/flac", "m4a": "audio/mp4", "aac": "audio/aac",
+    "opus": "audio/ogg", "weba": "audio/webm", "ogv": "video/ogg",
+    "mov": "video/quicktime", "mkv": "video/x-matroska", "avi": "video/x-msvideo",
+    "bmp": "image/bmp", "heic": "image/heic", "heif": "image/heif",
+    "apng": "image/apng", "tiff": "image/tiff", "tif": "image/tiff",
+    "ics": "text/calendar; charset=utf-8", "vtt": "text/vtt; charset=utf-8",
+    "yaml": "application/yaml; charset=utf-8", "yml": "application/yaml; charset=utf-8",
 }
 
 
@@ -428,6 +437,101 @@ def capability_route(decoded_path, token):
     return (tok == token, rest)
 
 
+# ---- qsHttpDate: epoch (UTC seconds) -> HTTP-date / IMF-fixdate --------------
+# Pure integer date math, no timezone conversion (mirrors qsHttpDate + its helpers
+# qsIsLeapYear/qsMonthLength/qsPad2). Empty for a negative/non-integer input. Validated
+# below against the stdlib's email.utils.formatdate(usegmt=True).
+
+def is_leap_year(y):
+    if y % 4 != 0:
+        return False
+    if y % 100 == 0 and y % 400 != 0:
+        return False
+    return True
+
+
+def month_length(m, leap):
+    lens = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+    if m == 2 and leap:
+        return 29
+    return lens[m - 1]
+
+
+def pad2(n):
+    return ("0" + str(n))[-2:]
+
+
+def http_date(epoch):
+    if not isinstance(epoch, int) or epoch < 0:
+        return ""
+    days = epoch // 86400
+    rem = epoch % 86400
+    hour, minute, sec = rem // 3600, (rem % 3600) // 60, rem % 60
+    dow = (days + 4) % 7          # 0=Sun ... 6=Sat (1970-01-01 = Thursday)
+    wdays = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
+    mons = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
+            "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+    year, leap = 1970, True
+    while True:
+        leap = is_leap_year(year)
+        ylen = 366 if leap else 365
+        if days < ylen:
+            break
+        days -= ylen
+        year += 1
+    mon = 1
+    for i in range(1, 13):
+        mlen = month_length(i, leap)
+        if days < mlen:
+            mon = i
+            break
+        days -= mlen
+    day = days + 1
+    return "%s, %s %s %d %s:%s:%s GMT" % (
+        wdays[dow], pad2(day), mons[mon - 1], year,
+        pad2(hour), pad2(minute), pad2(sec))
+
+
+# ---- qsHttpAllow: the Allow header value for a path --------------------------
+# Static verbs GET/HEAD/OPTIONS plus any route method registered for exactly this
+# path, in deterministic (sorted) order. Mirrors qsHttpAllow over the route table.
+
+def http_allow(route_keys, path):
+    extras = sorted({
+        k.split(" ", 1)[0]
+        for k in route_keys
+        if " " in k and k.split(" ", 1)[1] == path
+        and k.split(" ", 1)[0] not in ("GET", "HEAD", "OPTIONS")
+    })
+    return ", ".join(["GET", "HEAD", "OPTIONS"] + extras)
+
+
+# ---- qsEditLoginWait: editor login brute-force backoff -----------------------
+# ms this peer must still wait before another attempt. First _EDIT_FREE_TRIES fails are
+# free; after that the required gap doubles each fail, capped. Constants mirror the kEdit*
+# constants in the script - keep them in lockstep.
+_EDIT_FREE_TRIES = 4
+_EDIT_LOCK_BASE_MS = 1000
+_EDIT_LOCK_CAP_MS = 30000
+
+
+def edit_login_wait(fails, last_ms, now_ms):
+    if not isinstance(fails, int) or fails < _EDIT_FREE_TRIES:
+        return 0
+    exp = fails - _EDIT_FREE_TRIES
+    if exp > 20:
+        exp = 20
+    need = _EDIT_LOCK_BASE_MS * (2 ** exp)
+    if need > _EDIT_LOCK_CAP_MS:
+        need = _EDIT_LOCK_CAP_MS
+    if not isinstance(last_ms, int):
+        return 0
+    elapsed = now_ms - last_ms
+    if elapsed >= need:
+        return 0
+    return need - elapsed
+
+
 def main():
     total = 1000
     # -- byte-range parsing --
@@ -708,13 +812,57 @@ def main():
     ]:
         check("query_param(%r,%r)" % (query, name), query_param(query, name), want)
 
+    # -- HTTP-date formatting: cross-check the pure impl against the stdlib --
+    for epoch in [0, 1, 59, 60, 3599, 3600, 86399, 86400,
+                  951782400, 951868800,        # 2000-02-29 / 2000-03-01 (leap)
+                  1078012800,                   # 2004-02-29 (leap)
+                  1709164800, 1709251200,       # 2024-02-29 / 2024-03-01 (leap)
+                  1751812800, 1767225599,       # 2025 mid / 2025-12-31 23:59:59
+                  1735689600, 2147483647]:      # 2025-01-01 / the 2038 boundary
+        check("http_date(%d)" % epoch, http_date(epoch), formatdate(epoch, usegmt=True))
+    check("http_date(-1)", http_date(-1), "")
+    check("http_date('x')", http_date("x"), "")
+    check("http_date(0) literal", http_date(0), "Thu, 01 Jan 1970 00:00:00 GMT")
+
+    # -- Allow header: static verbs + registered route methods for a path --
+    _routes = ["GET /_qs/info", "GET /_edit", "POST /_edit/login",
+               "GET /_edit/api/list", "GET /_edit/api/read", "PUT /_edit/api/write"]
+    for path, want in [
+        ("/_edit/login", "GET, HEAD, OPTIONS, POST"),
+        ("/_edit/api/write", "GET, HEAD, OPTIONS, PUT"),
+        ("/_qs/info", "GET, HEAD, OPTIONS"),          # a GET route dedups into the static set
+        ("/nope", "GET, HEAD, OPTIONS"),              # no route -> just the static verbs
+    ]:
+        check("http_allow(%r)" % path, http_allow(_routes, path), want)
+    # multiple non-static methods on one path sort deterministically
+    check("http_allow multi",
+          http_allow(["POST /x", "PUT /x", "DELETE /x", "GET /x"], "/x"),
+          "GET, HEAD, OPTIONS, DELETE, POST, PUT")
+
+    # -- editor login brute-force backoff --
+    for fails, last_ms, now_ms, want in [
+        (0, None, 1000, 0),                     # first attempt: free
+        (3, 500, 600, 0),                       # still within the free tries
+        (4, 1000, 1000, 1000),                  # 1st throttled: base 1s, no time elapsed
+        (4, 1000, 1500, 500),                   # 500ms already waited -> 500 left
+        (4, 1000, 2000, 0),                     # full second elapsed -> allowed
+        (5, 1000, 1000, 2000),                  # doubles: 2s
+        (6, 1000, 1000, 4000),                  # 4s
+        (9, 1000, 1000, 30000),                 # 32s -> capped at 30s
+        (100, 1000, 1000, 30000),               # exponent bounded, still capped
+        (5, None, 1000, 0),                     # no recorded last attempt -> allowed
+    ]:
+        check("edit_login_wait(%r,%r,%r)" % (fails, last_ms, now_ms),
+              edit_login_wait(fails, last_ms, now_ms), want)
+
     if _fail:
         print("fileserver_golden: FAIL\n" + "\n".join(_fail))
         return 1
     print("fileserver_golden: OK (range parse, traversal guard, MIME, icon classify, "
           "HTML escape, capability gate, SPA fallback, HTTP framing, keep-alive req "
           "length, JSON escape, editor confinement, LAN-first gate, query parse, size "
-          "probe, filename sanitise, rate + ETA format all match)")
+          "probe, filename sanitise, rate + ETA format, HTTP-date, Allow header, "
+          "editor login backoff all match)")
     return 0
 
 

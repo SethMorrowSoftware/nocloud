@@ -150,6 +150,8 @@ local sEditOn           -- "true" when the editor is enabled for this session
 local sEditSalt         -- Argon2id salt for the edit password
 local sEditVerify       -- sxSecretBox verifier: proves a login password is correct
 local sEditSession      -- the current valid edit-session token (random hex), or empty
+local sEditFails        -- array: peer ip -> consecutive failed edit-login count (brute-force throttle)
+local sEditLastMs       -- array: peer ip -> the milliseconds of that peer's last login attempt
 -- Clearweb (direct, non-Tor) web sharing. A plain LiveCode socket HTTP server serves
 -- a file/folder to any browser at http://<ip>:<port>/<token>/... . No Cloud Quick Share's
 -- libtorrent opens the router port automatically (btMapPort / UPnP-NAT-PMP) and
@@ -248,6 +250,10 @@ constant kEditVerify = "BTXEDIT1"      -- plaintext sealed under the edit key to
 constant kEditMaxDepth = 32            -- editor file listing: recursion depth ceiling (anti-loop)
 constant kEditMaxFileBytes = 262144    -- editor: biggest file it will read/save (256 KB; a save
                                        -- is additionally bounded by kFsMaxReq at the transport)
+constant kEditFreeTries = 4            -- editor login: failed attempts allowed before throttling
+constant kEditLockBaseMs = 1000        -- editor login: base backoff after the free tries (doubles/fail)
+constant kEditLockCapMs = 30000        -- editor login: backoff ceiling (30 s)
+constant kEditFailWindowMs = 900000    -- editor login: forget a fail streak after 15 min of quiet
 constant kAnonSizeWarn = 268435456     -- 256 MiB: warn (never block) above this, anon path
 constant kTorSocksPort = "9050"        -- system/standalone tor
 constant kTorControlPort = "9051"
@@ -3651,11 +3657,124 @@ function qsHttpReason pCode
       return "Conflict"
    else if pCode is 413 then
       return "Payload Too Large"
+   else if pCode is 429 then
+      return "Too Many Requests"
    else if pCode is 500 then
       return "Internal Server Error"
    end if
    return "OK"
 end qsHttpReason
+
+-- Format an epoch (UTC seconds, as `the seconds` returns) as an HTTP-date / IMF-fixdate,
+-- e.g. "Sun, 06 Jul 2025 14:46:00 GMT". Pure integer math on the UTC day count, so it is
+-- correct regardless of the machine's local timezone (no `convert`, which is local). Empty
+-- for a negative/non-integer input. Mirrored by http_date() in the golden.
+function qsHttpDate pEpoch
+   local tDays, tRem, tHour, tMin, tSec, tDow, tYear, tYlen, tLeap, tMon, tMlen, tDay
+   local tWdays, tMons, tI
+   if pEpoch is not an integer or pEpoch < 0 then
+      return ""
+   end if
+   put pEpoch div 86400 into tDays         -- whole days since 1970-01-01 (a Thursday)
+   put pEpoch mod 86400 into tRem
+   put tRem div 3600 into tHour
+   put (tRem mod 3600) div 60 into tMin
+   put tRem mod 60 into tSec
+   put (tDays + 4) mod 7 into tDow          -- 0=Sun ... 6=Sat (1970-01-01 = Thursday = 4)
+   put "Sun,Mon,Tue,Wed,Thu,Fri,Sat" into tWdays
+   put "Jan,Feb,Mar,Apr,May,Jun,Jul,Aug,Sep,Oct,Nov,Dec" into tMons
+   put 1970 into tYear
+   repeat
+      put qsIsLeapYear(tYear) into tLeap
+      if tLeap then
+         put 366 into tYlen
+      else
+         put 365 into tYlen
+      end if
+      if tDays < tYlen then
+         exit repeat
+      end if
+      subtract tYlen from tDays
+      add 1 to tYear
+   end repeat                                -- tDays is now the 0-based day-of-year
+   put 1 into tMon
+   repeat with tI = 1 to 12
+      put qsMonthLength(tI, tLeap) into tMlen
+      if tDays < tMlen then
+         put tI into tMon
+         exit repeat
+      end if
+      subtract tMlen from tDays
+   end repeat
+   put tDays + 1 into tDay                   -- 1-based day of month
+   return (qsCommaItem(tWdays, tDow + 1) & ", " & qsPad2(tDay) & " " & \
+      qsCommaItem(tMons, tMon) & " " & tYear & " " & \
+      qsPad2(tHour) & ":" & qsPad2(tMin) & ":" & qsPad2(tSec) & " GMT")
+end qsHttpDate
+
+-- Gregorian leap year. Mirrored by is_leap_year() in the golden.
+function qsIsLeapYear pYear
+   if (pYear mod 4) is not 0 then
+      return false
+   end if
+   if (pYear mod 100) is 0 and (pYear mod 400) is not 0 then
+      return false
+   end if
+   return true
+end qsIsLeapYear
+
+-- Days in month pMon (1-12); pLeap true adds a day to February. Golden: month_length().
+function qsMonthLength pMon, pLeap
+   local tLens
+   put "31,28,31,30,31,30,31,31,30,31,30,31" into tLens
+   if pMon is 2 and pLeap then
+      return 29
+   end if
+   return qsCommaItem(tLens, pMon)
+end qsMonthLength
+
+-- The pIndex-th comma item of pList, without disturbing the caller's itemDelimiter.
+function qsCommaItem pList, pIndex
+   local tSavedID, tOut
+   put the itemDelimiter into tSavedID
+   set the itemDelimiter to ","
+   put item pIndex of pList into tOut
+   set the itemDelimiter to tSavedID
+   return tOut
+end qsCommaItem
+
+-- Two-digit zero-padded number (00..99+). Golden: pad2().
+function qsPad2 pN
+   return (char -2 to -1 of ("0" & pN))
+end qsPad2
+
+-- The Allow header value for pPath: the static verbs (GET, HEAD, OPTIONS) plus any method
+-- registered as a dynamic route for EXACTLY this path, in a deterministic (sorted) order.
+-- Pure over the route table; mirrored by http_allow() in the golden.
+function qsHttpAllow pPath
+   local tKey, tMethod, tRoutePath, tSp, tExtras, tOut
+   put "" into tExtras
+   repeat for each key tKey in sHttpRoutes
+      put offset(space, tKey) into tSp
+      if tSp < 1 then
+         next repeat
+      end if
+      put char 1 to (tSp - 1) of tKey into tMethod
+      put char (tSp + 1) to -1 of tKey into tRoutePath
+      if tRoutePath is pPath and tMethod is not "GET" and tMethod is not "HEAD" \
+            and tMethod is not "OPTIONS" then
+         put tMethod & return after tExtras
+      end if
+   end repeat
+   put "GET, HEAD, OPTIONS" into tOut
+   if tExtras is not empty then
+      delete char -1 of tExtras          -- drop the trailing return
+      sort lines of tExtras              -- deterministic regardless of array iteration order
+      replace return with ", " in tExtras
+      put ", " & tExtras after tOut
+   end if
+   return tOut
+end qsHttpAllow
 
 -- Escape a string for a JSON value (backslash FIRST, then the rest).
 function qsJsonEscape pText
@@ -3828,6 +3947,8 @@ function qsEditEnable pPassword
    end try
    put tSalt into sEditSalt
    put "" into sEditSession            -- force a fresh login under the new password
+   put empty into sEditFails           -- a new password clears any brute-force throttle
+   put empty into sEditLastMs
    put "true" into sEditOn
    return ""
 end qsEditEnable
@@ -3855,16 +3976,72 @@ command qsEditDisable
    put "" into sEditSalt
    put "" into sEditVerify
    put "" into sEditSession
+   put empty into sEditFails
+   put empty into sEditLastMs
 end qsEditDisable
+
+-- The peer IP a throttle keys on. The editor is clearweb-only (Tor is refused earlier),
+-- so this is the accepted-socket ip; Tor/unknown -> empty (no per-peer throttle bucket).
+function qsEditPeerIp pConn
+   if char 1 to 3 of pConn is "cw:" then
+      return qsCwPeer(char 4 to -1 of pConn)
+   end if
+   return ""
+end qsEditPeerIp
+
+-- How many ms this peer must STILL wait before another login attempt is allowed. The
+-- first kEditFreeTries failures are free; after that the required gap doubles each failure
+-- (kEditLockBaseMs, capped at kEditLockCapMs). Returns 0 to allow the attempt now. Pure;
+-- mirrored by edit_login_wait() in the golden.
+function qsEditLoginWait pFails, pLastMs, pNowMs
+   local tExp, tNeed, tElapsed
+   if pFails is not an integer or pFails < kEditFreeTries then
+      return 0
+   end if
+   put pFails - kEditFreeTries into tExp
+   if tExp > 20 then
+      put 20 into tExp                    -- bound the exponent; kEditLockCapMs caps it anyway
+   end if
+   put kEditLockBaseMs * (2 ^ tExp) into tNeed
+   if tNeed > kEditLockCapMs then
+      put kEditLockCapMs into tNeed
+   end if
+   if pLastMs is not an integer then
+      return 0
+   end if
+   put pNowMs - pLastMs into tElapsed
+   if tElapsed >= tNeed then
+      return 0
+   end if
+   return tNeed - tElapsed
+end qsEditLoginWait
 
 -- POST /_edit/login : the request body is the candidate password (raw UTF-8 bytes). On
 -- a correct password we mint a NEW random session token (invalidating any prior one)
 -- and return it as plain text for the browser to keep and send back in x-edit-token. A
--- wrong password -> 401, with no hint about which half was wrong.
+-- wrong password -> 401, with no hint about which half was wrong. A per-peer brute-force
+-- throttle is applied BEFORE the Argon2id hash, so a flood cannot even spin up the KDF.
 command qsEditLoginRoute pConn, pRequest
-   local tPass, tKey, tErr, tToken
+   local tPass, tKey, tErr, tToken, tIp, tFails, tNow, tWait
    if not qsEditReachable(pConn) then
       qsHttpReply pConn, 404, "text/plain; charset=utf-8", "Not found."
+      exit qsEditLoginRoute
+   end if
+   put qsEditPeerIp(pConn) into tIp
+   put the milliseconds into tNow
+   -- a streak gone quiet past the window is forgiven, so an honest user is never stuck
+   if tIp is not empty and sEditLastMs[tIp] is an integer \
+         and (tNow - sEditLastMs[tIp]) > kEditFailWindowMs then
+      put 0 into sEditFails[tIp]
+   end if
+   put sEditFails[tIp] into tFails
+   if tFails is not an integer then
+      put 0 into tFails
+   end if
+   put qsEditLoginWait(tFails, sEditLastMs[tIp], tNow) into tWait
+   if tWait > 0 then
+      qsHttpReply pConn, 429, "text/plain; charset=utf-8", \
+         ("Too many attempts. Try again in " & (tWait div 1000 + 1) & "s.")
       exit qsEditLoginRoute
    end if
    put textDecode(pRequest["__body"], "UTF-8") into tPass
@@ -3879,8 +4056,16 @@ command qsEditLoginRoute pConn, pRequest
       exit qsEditLoginRoute
    end try
    if not qsEditKeyOpens(tKey) then
+      if tIp is not empty then
+         add 1 to sEditFails[tIp]           -- record the failure for the throttle
+         put tNow into sEditLastMs[tIp]
+      end if
       qsHttpReply pConn, 401, "text/plain; charset=utf-8", "Wrong password."
       exit qsEditLoginRoute
+   end if
+   if tIp is not empty then
+      put 0 into sEditFails[tIp]             -- a correct password clears this peer's streak
+      delete variable sEditLastMs[tIp]
    end if
    put qsMakeToken(kEditTokenBytes) into tToken
    put tToken into sEditSession
@@ -4147,7 +4332,8 @@ end qsEditHtml
 -- Route: a folder (listing or its index.html, with a trailing-slash redirect), a
 -- file (streamed, Range-aware), else 404. Only GET/HEAD; ".." refused.
 command qsFsServePath pStream, pHeaders
-   local tRaw, tPath, tDisk, tIndex, tMethod, tRoot, tSpa, tRouteKey
+   local tRaw, tPath, tDisk, tIndex, tMethod, tRoot, tSpa, tRouteKey, tCrlf
+   put (numToChar(13) & numToChar(10)) into tCrlf
    put pHeaders["__method"] into tMethod
    put pHeaders["__path"] into tRaw          -- still %xx-encoded; used for the redirect Location
    put urlDecode(tRaw) into tPath            -- real chars for disk mapping
@@ -4179,8 +4365,12 @@ command qsFsServePath pStream, pHeaders
       qsHttpDispatch ("ox:" & pStream), sHttpRoutes[tRouteKey], pHeaders
       exit qsFsServePath
    end if
+   if tMethod is "OPTIONS" then
+      qsFsSendText pStream, "204 No Content", "text/plain; charset=utf-8", "", ("Allow: " & qsHttpAllow(tPath) & tCrlf)
+      exit qsFsServePath
+   end if
    if tMethod is not "GET" and tMethod is not "HEAD" then
-      qsFsSendText pStream, "405 Method Not Allowed", "text/plain; charset=utf-8", "Only GET and HEAD are supported."
+      qsFsSendText pStream, "405 Method Not Allowed", "text/plain; charset=utf-8", "Method not allowed.", ("Allow: " & qsHttpAllow(tPath) & tCrlf)
       exit qsFsServePath
    end if
    put sActiveShare["root"] into tRoot
@@ -4225,10 +4415,17 @@ end qsFsServePath
 -- files), and - because the folder can be edited live - tell the browser to revalidate
 -- rather than serve a stale cached copy.
 function qsHttpExtraHeaders
-   local tCrlf
+   local tCrlf, tDate, tOut
    put (numToChar(13) & numToChar(10)) into tCrlf
-   return ("Server: No Cloud Quick Share" & tCrlf & "X-Content-Type-Options: nosniff" & tCrlf & \
-      "Cache-Control: no-cache" & tCrlf)
+   put "Server: No Cloud Quick Share" & tCrlf into tOut
+   -- `the seconds` is UTC epoch, so qsHttpDate needs no timezone conversion. A blank
+   -- (should not happen) simply omits the Date line rather than sending a broken one.
+   put qsHttpDate(the seconds) into tDate
+   if tDate is not empty then
+      put "Date: " & tDate & tCrlf after tOut
+   end if
+   put "X-Content-Type-Options: nosniff" & tCrlf & "Cache-Control: no-cache" & tCrlf after tOut
+   return tOut
 end qsHttpExtraHeaders
 
 -- A filename safe to drop into a Content-Disposition quoted-string: printable ASCII
@@ -4391,13 +4588,16 @@ command qsFsFinish pStream
    qsFsCleanup pStream
 end qsFsFinish
 
-command qsFsSendText pStream, pStatus, pType, pBody
+-- pExtra (optional): additional CRLF-terminated response header lines (e.g. "Allow: ...").
+-- Existing callers pass four arguments, so pExtra is empty and the output is unchanged.
+command qsFsSendText pStream, pStatus, pType, pBody, pExtra
    local tData, tHead, tCrlf
    put (numToChar(13) & numToChar(10)) into tCrlf
    put textEncode(pBody, "UTF-8") into tData
    put ("HTTP/1.1 " & pStatus & tCrlf & "Content-Type: " & pType & tCrlf & \
       "Content-Length: " & (the number of bytes in tData) & tCrlf) into tHead
    put qsHttpExtraHeaders() after tHead
+   put pExtra after tHead
    put ("Connection: close" & tCrlf & tCrlf) after tHead
    oxWrite pStream, (textEncode(tHead, "UTF-8") & tData)
    oxCloseStream pStream
@@ -4833,6 +5033,40 @@ function qsFsMime pPath
       return "image/avif"
    else if tExtn is "csv" then
       return "text/csv; charset=utf-8"
+   else if tExtn is "flac" then
+      return "audio/flac"
+   else if tExtn is "m4a" then
+      return "audio/mp4"
+   else if tExtn is "aac" then
+      return "audio/aac"
+   else if tExtn is "opus" then
+      return "audio/ogg"
+   else if tExtn is "weba" then
+      return "audio/webm"
+   else if tExtn is "ogv" then
+      return "video/ogg"
+   else if tExtn is "mov" then
+      return "video/quicktime"
+   else if tExtn is "mkv" then
+      return "video/x-matroska"
+   else if tExtn is "avi" then
+      return "video/x-msvideo"
+   else if tExtn is "bmp" then
+      return "image/bmp"
+   else if tExtn is "heic" then
+      return "image/heic"
+   else if tExtn is "heif" then
+      return "image/heif"
+   else if tExtn is "apng" then
+      return "image/apng"
+   else if tExtn is "tiff" or tExtn is "tif" then
+      return "image/tiff"
+   else if tExtn is "ics" then
+      return "text/calendar; charset=utf-8"
+   else if tExtn is "vtt" then
+      return "text/vtt; charset=utf-8"
+   else if tExtn is "yaml" or tExtn is "yml" then
+      return "application/yaml; charset=utf-8"
    end if
    return "application/octet-stream"
 end qsFsMime
@@ -5034,7 +5268,8 @@ end qsCwData
 -- Parse, check the capability token (the first path segment), then route: for a file
 -- share only the one file is reachable; for a folder share, browse within the root.
 command qsCwServe pSocketID
-   local tHeaders, tMethod, tRaw, tPath, tTok, tRest, tDisk, tIndex, tSavedID, tSpa, tRouteKey
+   local tHeaders, tMethod, tRaw, tPath, tTok, tRest, tDisk, tIndex, tSavedID, tSpa, tRouteKey, tCrlf
+   put (numToChar(13) & numToChar(10)) into tCrlf
    put qsHttpParse(sCwReq[pSocketID]) into tHeaders
    put tHeaders["__method"] into tMethod
    put tMethod into sCwMethod[pSocketID]   -- a HEAD reply must carry no body (qsCwSendText)
@@ -5092,8 +5327,12 @@ command qsCwServe pSocketID
       qsHttpDispatch ("cw:" & pSocketID), sHttpRoutes[tRouteKey], tHeaders
       exit qsCwServe
    end if
+   if tMethod is "OPTIONS" then
+      qsCwSendText pSocketID, "204 No Content", "text/plain; charset=utf-8", "", ("Allow: " & qsHttpAllow(tRest) & tCrlf)
+      exit qsCwServe
+   end if
    if tMethod is not "GET" and tMethod is not "HEAD" then
-      qsCwSendText pSocketID, "405 Method Not Allowed", "text/plain; charset=utf-8", "Only GET and HEAD are supported."
+      qsCwSendText pSocketID, "405 Method Not Allowed", "text/plain; charset=utf-8", "Method not allowed.", ("Allow: " & qsHttpAllow(tRest) & tCrlf)
       exit qsCwServe
    end if
    if sCwKind is "file" then
@@ -5265,7 +5504,9 @@ function qsCwWantsKeep pSocketID
    return (sCwKeep[pSocketID] is "true" and sCwReqCount[pSocketID] < (kCwMaxKeepAlive - 1))
 end qsCwWantsKeep
 
-command qsCwSendText pSocketID, pStatus, pType, pBody
+-- pExtra (optional): additional CRLF-terminated response header lines (e.g. "Allow: ...").
+-- Existing callers pass four arguments, so pExtra is empty and the output is unchanged.
+command qsCwSendText pSocketID, pStatus, pType, pBody, pExtra
    local tData, tHead, tCrlf, tKeep, tBody
    put (numToChar(13) & numToChar(10)) into tCrlf
    put textEncode(pBody, "UTF-8") into tData
@@ -5273,6 +5514,7 @@ command qsCwSendText pSocketID, pStatus, pType, pBody
    put ("HTTP/1.1 " & pStatus & tCrlf & "Content-Type: " & pType & tCrlf & \
       "Content-Length: " & (the number of bytes in tData) & tCrlf) into tHead
    put qsHttpExtraHeaders() after tHead
+   put pExtra after tHead
    -- a HEAD reply must report the accurate Content-Length a GET would return but send NO
    -- body; on a kept-alive connection an unread body would be mis-read as the framing of
    -- the next response. (The file path already handles HEAD in qsCwServeFile.)
