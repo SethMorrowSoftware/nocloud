@@ -1044,6 +1044,7 @@ command qsStart
    -- script: on myHandler pConn, pRequest ... qsHttpReply pConn, 200, ...).
    put empty into sHttpRoutes
    qsHttpRoute "GET", "/_qs/info", "qsInfoRoute"
+   qsHttpRoute "GET", "/_qs/transparency", "qsTransparencyRoute"
    -- the live web editor (Phase C). Always registered, but every handler refuses unless
    -- the editor is enabled AND the caller is LAN-local (see qsEditReachable), so these
    -- routes are invisible (404) to Tor and to public clearweb visitors.
@@ -3789,26 +3790,81 @@ function qsJsonEscape pText
    return tOut
 end qsJsonEscape
 
--- The built-in demo route (registered in qsStart): GET /_qs/info returns a little live
--- share metadata as JSON. Copy this shape for your own routes.
-command qsInfoRoute pConn, pRequest
-   local tJson, tName, tMode, tQ
-   put "" into tName
-   put "none" into tMode
+-- Which transport is live: "clearweb", "tor", or "none". Used by the /_qs/* endpoints so
+-- they describe the share the same way. Reads session state only (nothing to leak).
+function qsShareMode
    if sCwActive is "true" then
-      put sCwName into tName
-      put "clearweb" into tMode
+      return "clearweb"
    else if sActiveShare["kind"] is "folder" then
+      return "tor"
+   end if
+   return "none"
+end qsShareMode
+
+-- The disk root of the served folder (no trailing slash), or empty for a single-file
+-- share / nothing shared. NEVER put this in a response - it is a local absolute path.
+function qsShareRoot
+   if sCwActive is "true" then
+      return sCwRoot
+   else if sActiveShare["kind"] is "folder" then
+      return sActiveShare["root"]
+   end if
+   return ""
+end qsShareRoot
+
+-- The built-in demo route (registered in qsStart): GET /_qs/info returns a little live
+-- share metadata as JSON. Copy this shape for your own routes. Every field here is safe to
+-- expose to an anonymous visitor (no IP, no path, no token, no editor state).
+command qsInfoRoute pConn, pRequest
+   local tJson, tName, tMode, tQ, tRoot, tSpa
+   put qsShareMode() into tMode
+   put "" into tName
+   if tMode is "clearweb" then
+      put sCwName into tName
+   else if tMode is "tor" then
       put sActiveShare["name"] into tName
-      put "tor" into tMode
+   end if
+   put "false" into tSpa                    -- does the served folder have an index.html?
+   put qsShareRoot() into tRoot
+   if tRoot is not empty and there is a file (tRoot & "/index.html") then
+      put "true" into tSpa
    end if
    put quote into tQ
    put "{" & tQ & "app" & tQ & ":" & tQ & "No Cloud Quick Share" & tQ & "," & \
+      tQ & "version" & tQ & ":" & tQ & qsJsonEscape(kQsAppVersion) & tQ & "," & \
       tQ & "mode" & tQ & ":" & tQ & qsJsonEscape(tMode) & tQ & "," & \
       tQ & "share" & tQ & ":" & tQ & qsJsonEscape(tName) & tQ & "," & \
+      tQ & "spa" & tQ & ":" & tSpa & "," & \
       tQ & "method" & tQ & ":" & tQ & qsJsonEscape(pRequest["__method"]) & tQ & "}" into tJson
    qsHttpReply pConn, 200, "application/json; charset=utf-8", tJson
 end qsInfoRoute
+
+-- GET /_qs/transparency : a machine-readable version of docs/what-it-hides.md, so a client
+-- can SHOW the honest privacy posture of the current transport. States the model; leaks
+-- nothing. The web host itself serves plain bytes, so files_encrypted is always false here
+-- (the optional passphrase encryption is a separate share-CODE feature, not the web path).
+command qsTransparencyRoute pConn, pRequest
+   local tJson, tQ, tMode, tIpVis, tHidden, tTransEnc
+   put qsShareMode() into tMode
+   if tMode is "tor" then
+      put "false" into tIpVis                -- over Tor your IP is hidden from visitors
+      put "true" into tHidden                -- and neither end learns the other's location
+      put "true" into tTransEnc              -- the onion stream is encrypted in transit
+   else
+      put "true" into tIpVis                 -- a web link exposes your IP to visitors
+      put "false" into tHidden
+      put "false" into tTransEnc              -- plain HTTP
+   end if
+   put quote into tQ
+   put "{" & tQ & "transport" & tQ & ":" & tQ & qsJsonEscape(tMode) & tQ & "," & \
+      tQ & "ip_visible_to_peers" & tQ & ":" & tIpVis & "," & \
+      tQ & "both_ends_hidden" & tQ & ":" & tHidden & "," & \
+      tQ & "transport_encrypted" & tQ & ":" & tTransEnc & "," & \
+      tQ & "files_encrypted" & tQ & ":false," & \
+      tQ & "logging" & tQ & ":" & tQ & "none" & tQ & "," & \
+      tQ & "ephemeral" & tQ & ":true}" into tJson
+   qsHttpReply pConn, 200, "application/json; charset=utf-8", tJson
+end qsTransparencyRoute
 
 -- ============================================================================
 -- THE LIVE WEB EDITOR (Phase C). LAN-ONLY, password-gated, OFF by default. See the
