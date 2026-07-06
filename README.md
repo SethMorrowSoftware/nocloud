@@ -77,10 +77,13 @@ operational limit (there is no "upload and walk away").
 
 ## The bundled web app
 
-[`webapp/`](webapp/) is a small self-contained single-page app you can drop into a
-served folder to demonstrate hosting a real website over a web link or a Tor page —
-static assets, HTTP Range, SPA routing, a service worker, a PWA manifest, and the
-live `/_qs/info` backend route. See [docs/webapp.md](docs/webapp.md).
+[`webapp/`](webapp/) is a self-contained single-page app you can drop into a served
+folder to demonstrate hosting a real website over a web link or a Tor page. It stages
+a whole little internet from one folder — an image **gallery**, a **streaming cinema**
+(a procedural short film that seeks over HTTP Range, in WebM *and* MP4), a **music**
+page with a playlist player, a **storefront** with a cart and real `?dl` forced-download
+delivery, a **blog** with shareable deep links, a service worker, a PWA manifest, and
+the live `/_qs/info` backend route. See [docs/webapp.md](docs/webapp.md).
 
 ## Building a standalone
 
