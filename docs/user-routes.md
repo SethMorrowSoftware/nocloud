@@ -119,6 +119,9 @@ There is still **no scripting** — templating only substitutes these fixed, esc
 - **Dotfiles stay hidden:** a `file` route can't point at a hidden dot-file (`.env`, `.git/…`,
   `.qsroutes.json` itself) — those are invisible over both transports, exactly as they are to
   the static file paths. Such a route is skipped.
+- **See what's active:** `GET /_qs/routes` returns a read-only JSON list of the custom routes the
+  served folder loaded (method + path + kind only — never the file target, the redirect target, or
+  any disk path), so you can confirm your `.qsroutes.json` was picked up.
 - **Reload:** the file is read when you start sharing the folder. If you edit it while
   sharing, stop and re-share (or share it again) to pick up the changes.
 - **Limits:** up to 100 routes per file; the config file is read up to 256 KB; each inline

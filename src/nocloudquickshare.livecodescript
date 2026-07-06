@@ -1058,6 +1058,7 @@ command qsStart
    put empty into sHttpRoutes
    qsHttpRoute "GET", "/_qs/info", "qsInfoRoute"
    qsHttpRoute "GET", "/_qs/transparency", "qsTransparencyRoute"
+   qsHttpRoute "GET", "/_qs/routes", "qsRoutesRoute"
    -- the live web editor (Phase C). Always registered, but every handler refuses unless
    -- the editor is enabled AND the caller is LAN-local (see qsEditReachable), so these
    -- routes are invisible (404) to Tor and to public clearweb visitors.
@@ -3642,15 +3643,17 @@ end qsHttpDispatch
 -- Reply from a route handler, transport-neutral. pConn is "ox:<stream>" (onion) or
 -- "cw:<socket>" (clearweb); we route to the matching one-shot text sender, which sets
 -- Content-Length, closes, and cleans up.
-command qsHttpReply pConn, pCode, pType, pBody
+-- pExtra (optional): additional CRLF-terminated response header lines (e.g. "Retry-After: ...").
+-- Existing callers pass four arguments, so pExtra is empty and the output is unchanged.
+command qsHttpReply pConn, pCode, pType, pBody, pExtra
    local tKind, tId, tStatus
    put char 1 to 3 of pConn into tKind
    put char 4 to -1 of pConn into tId
    put pCode & space & qsHttpReason(pCode) into tStatus
    if tKind is "ox:" then
-      qsFsSendText tId, tStatus, pType, pBody
+      qsFsSendText tId, tStatus, pType, pBody, pExtra
    else
-      qsCwSendText tId, tStatus, pType, pBody
+      qsCwSendText tId, tStatus, pType, pBody, pExtra
    end if
 end qsHttpReply
 
@@ -3777,23 +3780,37 @@ function qsPad2 pN
 end qsPad2
 
 -- The Allow header value for pPath: the static verbs (GET, HEAD, OPTIONS) plus any method
--- registered as a dynamic route for EXACTLY this path, in a deterministic (sorted) order.
--- Pure over the route table; mirrored by http_allow() in the golden.
-function qsHttpAllow pPath
+-- registered as a dynamic route for EXACTLY this path - both built-in routes (sHttpRoutes) and,
+-- when pRoot is given, the shared folder's user-declared .qsroutes.json routes - in a
+-- deterministic (sorted) order, de-duplicated. Both route tables key on "METHOD /path", so the
+-- same split works for each. Pure over those tables; mirrored by http_allow() in the golden.
+function qsHttpAllow pPath, pRoot
    local tKey, tMethod, tRoutePath, tSp, tExtras, tOut
    put "" into tExtras
    repeat for each key tKey in sHttpRoutes
       put offset(space, tKey) into tSp
-      if tSp < 1 then
-         next repeat
-      end if
-      put char 1 to (tSp - 1) of tKey into tMethod
-      put char (tSp + 1) to -1 of tKey into tRoutePath
-      if tRoutePath is pPath and tMethod is not "GET" and tMethod is not "HEAD" \
-            and tMethod is not "OPTIONS" then
-         put tMethod & return after tExtras
+      if tSp >= 1 then
+         put char 1 to (tSp - 1) of tKey into tMethod
+         put char (tSp + 1) to -1 of tKey into tRoutePath
+         if tRoutePath is pPath and tMethod is not "GET" and tMethod is not "HEAD" \
+               and tMethod is not "OPTIONS" and tMethod is not among the lines of tExtras then
+            put tMethod & return after tExtras
+         end if
       end if
    end repeat
+   if pRoot is not empty then
+      repeat for each key tKey in sUserRoutes[pRoot]
+         put offset(space, tKey) into tSp
+         if tSp >= 1 then
+            put char 1 to (tSp - 1) of tKey into tMethod
+            put char (tSp + 1) to -1 of tKey into tRoutePath
+            if tRoutePath is pPath and tMethod is not "GET" and tMethod is not "HEAD" \
+                  and tMethod is not "OPTIONS" and tMethod is not among the lines of tExtras then
+               put tMethod & return after tExtras
+            end if
+         end if
+      end repeat
+   end if
    put "GET, HEAD, OPTIONS" into tOut
    if tExtras is not empty then
       delete char -1 of tExtras          -- drop the trailing return
@@ -3892,6 +3909,43 @@ command qsTransparencyRoute pConn, pRequest
       tQ & "ephemeral" & tQ & ":true}" into tJson
    qsHttpReply pConn, 200, "application/json; charset=utf-8", tJson
 end qsTransparencyRoute
+
+-- GET /_qs/routes : a read-only listing of the custom routes the served folder declared in its
+-- .qsroutes.json (method + path + kind only - never the file target, the redirect Location, or
+-- the disk root), so a client/demo can SHOW what a dropped-in config produced. Transport-correct
+-- by design: it reads the connection tag (ox:/cw:) to pick THIS share's root, so a Tor visitor
+-- and a concurrent clearweb share never see each other's routes. Loads lazily (qsEnsureUserRoutes)
+-- exactly like the serve paths, so it reflects what a real request would match.
+command qsRoutesRoute pConn, pRequest
+   local tKind, tRoot, tKey, tDesc, tQ, tItems, tCount, tMethod, tPath, tJson
+   put char 1 to 2 of pConn into tKind          -- "ox" (Tor) or "cw" (clearweb)
+   if tKind is "ox" then
+      put sActiveShare["root"] into tRoot
+   else
+      put sCwRoot into tRoot
+   end if
+   put quote into tQ
+   put "" into tItems
+   put 0 into tCount
+   if tRoot is not empty then
+      qsEnsureUserRoutes tRoot                   -- same lazy load the serve paths use
+      repeat for each key tKey in sUserRoutes[tRoot]
+         put sUserRoutes[tRoot][tKey] into tDesc
+         put word 1 of tKey into tMethod         -- keys are "METHOD /path" (space-joined)
+         put word 2 to -1 of tKey into tPath
+         if tItems is not empty then
+            put "," after tItems
+         end if
+         put "{" & tQ & "method" & tQ & ":" & tQ & qsJsonEscape(tMethod) & tQ & "," & \
+            tQ & "path" & tQ & ":" & tQ & qsJsonEscape(tPath) & tQ & "," & \
+            tQ & "kind" & tQ & ":" & tQ & qsJsonEscape(tDesc["kind"]) & tQ & "}" after tItems
+         add 1 to tCount
+      end repeat
+   end if
+   put "{" & tQ & "count" & tQ & ":" & tCount & "," & \
+      tQ & "routes" & tQ & ":[" & tItems & "]}" into tJson
+   qsHttpReply pConn, 200, "application/json; charset=utf-8", tJson
+end qsRoutesRoute
 
 -- ============================================================================
 -- USER-DEFINED API ROUTES (.qsroutes.json). Let someone who never opens the stack add
@@ -4467,7 +4521,7 @@ end qsEditLoginWait
 -- wrong password -> 401, with no hint about which half was wrong. A per-peer brute-force
 -- throttle is applied BEFORE the Argon2id hash, so a flood cannot even spin up the KDF.
 command qsEditLoginRoute pConn, pRequest
-   local tPass, tKey, tErr, tToken, tIp, tFails, tNow, tWait
+   local tPass, tKey, tErr, tToken, tIp, tFails, tNow, tWait, tRetry
    if not qsEditReachable(pConn) then
       qsHttpReply pConn, 404, "text/plain; charset=utf-8", "Not found."
       exit qsEditLoginRoute
@@ -4485,8 +4539,12 @@ command qsEditLoginRoute pConn, pRequest
    end if
    put qsEditLoginWait(tFails, sEditLastMs[tIp], tNow) into tWait
    if tWait > 0 then
+      -- Retry-After (whole seconds, rounded up) so a well-behaved client waits exactly long
+      -- enough instead of hammering; matches the human-readable delay in the body.
+      put (tWait div 1000 + 1) into tRetry
       qsHttpReply pConn, 429, "text/plain; charset=utf-8", \
-         ("Too many attempts. Try again in " & (tWait div 1000 + 1) & "s.")
+         ("Too many attempts. Try again in " & tRetry & "s."), \
+         ("Retry-After: " & tRetry & numToChar(13) & numToChar(10))
       exit qsEditLoginRoute
    end if
    put textDecode(pRequest["__body"], "UTF-8") into tPass
@@ -4820,11 +4878,11 @@ command qsFsServePath pStream, pHeaders
    if tMethod is "OPTIONS" then
       -- 200 with an empty body (not 204: a 204 must not carry Content-Length, which the
       -- shared text sender always sets). Advertise the methods this path accepts.
-      qsFsSendText pStream, "200 OK", "text/plain; charset=utf-8", "", ("Allow: " & qsHttpAllow(tPath) & tCrlf)
+      qsFsSendText pStream, "200 OK", "text/plain; charset=utf-8", "", ("Allow: " & qsHttpAllow(tPath, sActiveShare["root"]) & tCrlf)
       exit qsFsServePath
    end if
    if tMethod is not "GET" and tMethod is not "HEAD" then
-      qsFsSendText pStream, "405 Method Not Allowed", "text/plain; charset=utf-8", "Method not allowed.", ("Allow: " & qsHttpAllow(tPath) & tCrlf)
+      qsFsSendText pStream, "405 Method Not Allowed", "text/plain; charset=utf-8", "Method not allowed.", ("Allow: " & qsHttpAllow(tPath, sActiveShare["root"]) & tCrlf)
       exit qsFsServePath
    end if
    put sActiveShare["root"] into tRoot
@@ -4867,11 +4925,17 @@ end qsFsServePath
 -- Response headers added to EVERYTHING we serve (both transports), as CRLF-terminated
 -- lines: identify the server, forbid MIME sniffing (safer when hosting untrusted-looking
 -- files), and - because the folder can be edited live - tell the browser to revalidate
--- rather than serve a stale cached copy. Two privacy/safety headers ride along for an app
--- whose whole point is not leaking: `Referrer-Policy: no-referrer` (a page served here never
--- leaks its own URL - a Tor .onion or a capability-token web link - to anywhere it links out
--- to), and `X-Frame-Options: DENY` (the page cannot be framed, so it cannot be clickjacked;
--- these pages are meant to be visited directly, never embedded).
+-- rather than serve a stale cached copy. Four privacy/safety headers ride along for an app
+-- whose whole point is not leaking:
+--   * Referrer-Policy: no-referrer  - a page served here never leaks its own URL (a Tor .onion
+--       address or a capability-token web link) to anywhere it links out to.
+--   * X-Frame-Options: DENY         - the page cannot be framed, so it cannot be clickjacked;
+--       these pages are meant to be visited directly, never embedded.
+--   * X-Robots-Tag: noindex, nofollow - a temporary share link is not for search engines; keep
+--       it out of the index (a deliberate default for a share tool - flip it if you host a
+--       public site over a web link and WANT it crawled).
+--   * Permissions-Policy: browsing-topics=() - opt every response out of the browser's ad-topics
+--       (FLoC successor) sampling; nothing here needs it, and a no-cloud app should not feed it.
 function qsHttpExtraHeaders
    local tCrlf, tDate, tOut
    put (numToChar(13) & numToChar(10)) into tCrlf
@@ -4884,6 +4948,7 @@ function qsHttpExtraHeaders
    end if
    put "X-Content-Type-Options: nosniff" & tCrlf & "Cache-Control: no-cache" & tCrlf after tOut
    put "Referrer-Policy: no-referrer" & tCrlf & "X-Frame-Options: DENY" & tCrlf after tOut
+   put "X-Robots-Tag: noindex, nofollow" & tCrlf & "Permissions-Policy: browsing-topics=()" & tCrlf after tOut
    return tOut
 end qsHttpExtraHeaders
 
@@ -5803,11 +5868,11 @@ command qsCwServe pSocketID
    if tMethod is "OPTIONS" then
       -- 200 + empty body (not 204: a 204 must not carry the Content-Length the shared
       -- sender always sets); keep-alive stays clean since the body is empty.
-      qsCwSendText pSocketID, "200 OK", "text/plain; charset=utf-8", "", ("Allow: " & qsHttpAllow(tRest) & tCrlf)
+      qsCwSendText pSocketID, "200 OK", "text/plain; charset=utf-8", "", ("Allow: " & qsHttpAllow(tRest, sCwRoot) & tCrlf)
       exit qsCwServe
    end if
    if tMethod is not "GET" and tMethod is not "HEAD" then
-      qsCwSendText pSocketID, "405 Method Not Allowed", "text/plain; charset=utf-8", "Method not allowed.", ("Allow: " & qsHttpAllow(tRest) & tCrlf)
+      qsCwSendText pSocketID, "405 Method Not Allowed", "text/plain; charset=utf-8", "Method not allowed.", ("Allow: " & qsHttpAllow(tRest, sCwRoot) & tCrlf)
       exit qsCwServe
    end if
    if sCwKind is "file" then
