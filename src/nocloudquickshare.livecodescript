@@ -3643,15 +3643,17 @@ end qsHttpDispatch
 -- Reply from a route handler, transport-neutral. pConn is "ox:<stream>" (onion) or
 -- "cw:<socket>" (clearweb); we route to the matching one-shot text sender, which sets
 -- Content-Length, closes, and cleans up.
-command qsHttpReply pConn, pCode, pType, pBody
+-- pExtra (optional): additional CRLF-terminated response header lines (e.g. "Retry-After: ...").
+-- Existing callers pass four arguments, so pExtra is empty and the output is unchanged.
+command qsHttpReply pConn, pCode, pType, pBody, pExtra
    local tKind, tId, tStatus
    put char 1 to 3 of pConn into tKind
    put char 4 to -1 of pConn into tId
    put pCode & space & qsHttpReason(pCode) into tStatus
    if tKind is "ox:" then
-      qsFsSendText tId, tStatus, pType, pBody
+      qsFsSendText tId, tStatus, pType, pBody, pExtra
    else
-      qsCwSendText tId, tStatus, pType, pBody
+      qsCwSendText tId, tStatus, pType, pBody, pExtra
    end if
 end qsHttpReply
 
@@ -3778,23 +3780,37 @@ function qsPad2 pN
 end qsPad2
 
 -- The Allow header value for pPath: the static verbs (GET, HEAD, OPTIONS) plus any method
--- registered as a dynamic route for EXACTLY this path, in a deterministic (sorted) order.
--- Pure over the route table; mirrored by http_allow() in the golden.
-function qsHttpAllow pPath
+-- registered as a dynamic route for EXACTLY this path - both built-in routes (sHttpRoutes) and,
+-- when pRoot is given, the shared folder's user-declared .qsroutes.json routes - in a
+-- deterministic (sorted) order, de-duplicated. Both route tables key on "METHOD /path", so the
+-- same split works for each. Pure over those tables; mirrored by http_allow() in the golden.
+function qsHttpAllow pPath, pRoot
    local tKey, tMethod, tRoutePath, tSp, tExtras, tOut
    put "" into tExtras
    repeat for each key tKey in sHttpRoutes
       put offset(space, tKey) into tSp
-      if tSp < 1 then
-         next repeat
-      end if
-      put char 1 to (tSp - 1) of tKey into tMethod
-      put char (tSp + 1) to -1 of tKey into tRoutePath
-      if tRoutePath is pPath and tMethod is not "GET" and tMethod is not "HEAD" \
-            and tMethod is not "OPTIONS" then
-         put tMethod & return after tExtras
+      if tSp >= 1 then
+         put char 1 to (tSp - 1) of tKey into tMethod
+         put char (tSp + 1) to -1 of tKey into tRoutePath
+         if tRoutePath is pPath and tMethod is not "GET" and tMethod is not "HEAD" \
+               and tMethod is not "OPTIONS" and tMethod is not among the lines of tExtras then
+            put tMethod & return after tExtras
+         end if
       end if
    end repeat
+   if pRoot is not empty then
+      repeat for each key tKey in sUserRoutes[pRoot]
+         put offset(space, tKey) into tSp
+         if tSp >= 1 then
+            put char 1 to (tSp - 1) of tKey into tMethod
+            put char (tSp + 1) to -1 of tKey into tRoutePath
+            if tRoutePath is pPath and tMethod is not "GET" and tMethod is not "HEAD" \
+                  and tMethod is not "OPTIONS" and tMethod is not among the lines of tExtras then
+               put tMethod & return after tExtras
+            end if
+         end if
+      end repeat
+   end if
    put "GET, HEAD, OPTIONS" into tOut
    if tExtras is not empty then
       delete char -1 of tExtras          -- drop the trailing return
@@ -4505,7 +4521,7 @@ end qsEditLoginWait
 -- wrong password -> 401, with no hint about which half was wrong. A per-peer brute-force
 -- throttle is applied BEFORE the Argon2id hash, so a flood cannot even spin up the KDF.
 command qsEditLoginRoute pConn, pRequest
-   local tPass, tKey, tErr, tToken, tIp, tFails, tNow, tWait
+   local tPass, tKey, tErr, tToken, tIp, tFails, tNow, tWait, tRetry
    if not qsEditReachable(pConn) then
       qsHttpReply pConn, 404, "text/plain; charset=utf-8", "Not found."
       exit qsEditLoginRoute
@@ -4523,8 +4539,12 @@ command qsEditLoginRoute pConn, pRequest
    end if
    put qsEditLoginWait(tFails, sEditLastMs[tIp], tNow) into tWait
    if tWait > 0 then
+      -- Retry-After (whole seconds, rounded up) so a well-behaved client waits exactly long
+      -- enough instead of hammering; matches the human-readable delay in the body.
+      put (tWait div 1000 + 1) into tRetry
       qsHttpReply pConn, 429, "text/plain; charset=utf-8", \
-         ("Too many attempts. Try again in " & (tWait div 1000 + 1) & "s.")
+         ("Too many attempts. Try again in " & tRetry & "s."), \
+         ("Retry-After: " & tRetry & numToChar(13) & numToChar(10))
       exit qsEditLoginRoute
    end if
    put textDecode(pRequest["__body"], "UTF-8") into tPass
@@ -4858,11 +4878,11 @@ command qsFsServePath pStream, pHeaders
    if tMethod is "OPTIONS" then
       -- 200 with an empty body (not 204: a 204 must not carry Content-Length, which the
       -- shared text sender always sets). Advertise the methods this path accepts.
-      qsFsSendText pStream, "200 OK", "text/plain; charset=utf-8", "", ("Allow: " & qsHttpAllow(tPath) & tCrlf)
+      qsFsSendText pStream, "200 OK", "text/plain; charset=utf-8", "", ("Allow: " & qsHttpAllow(tPath, sActiveShare["root"]) & tCrlf)
       exit qsFsServePath
    end if
    if tMethod is not "GET" and tMethod is not "HEAD" then
-      qsFsSendText pStream, "405 Method Not Allowed", "text/plain; charset=utf-8", "Method not allowed.", ("Allow: " & qsHttpAllow(tPath) & tCrlf)
+      qsFsSendText pStream, "405 Method Not Allowed", "text/plain; charset=utf-8", "Method not allowed.", ("Allow: " & qsHttpAllow(tPath, sActiveShare["root"]) & tCrlf)
       exit qsFsServePath
    end if
    put sActiveShare["root"] into tRoot
@@ -5848,11 +5868,11 @@ command qsCwServe pSocketID
    if tMethod is "OPTIONS" then
       -- 200 + empty body (not 204: a 204 must not carry the Content-Length the shared
       -- sender always sets); keep-alive stays clean since the body is empty.
-      qsCwSendText pSocketID, "200 OK", "text/plain; charset=utf-8", "", ("Allow: " & qsHttpAllow(tRest) & tCrlf)
+      qsCwSendText pSocketID, "200 OK", "text/plain; charset=utf-8", "", ("Allow: " & qsHttpAllow(tRest, sCwRoot) & tCrlf)
       exit qsCwServe
    end if
    if tMethod is not "GET" and tMethod is not "HEAD" then
-      qsCwSendText pSocketID, "405 Method Not Allowed", "text/plain; charset=utf-8", "Method not allowed.", ("Allow: " & qsHttpAllow(tRest) & tCrlf)
+      qsCwSendText pSocketID, "405 Method Not Allowed", "text/plain; charset=utf-8", "Method not allowed.", ("Allow: " & qsHttpAllow(tRest, sCwRoot) & tCrlf)
       exit qsCwServe
    end if
    if sCwKind is "file" then

@@ -493,13 +493,16 @@ def http_date(epoch):
 
 
 # ---- qsHttpAllow: the Allow header value for a path --------------------------
-# Static verbs GET/HEAD/OPTIONS plus any route method registered for exactly this
-# path, in deterministic (sorted) order. Mirrors qsHttpAllow over the route table.
+# Static verbs GET/HEAD/OPTIONS plus any method registered for exactly this path -
+# across BOTH the built-in route table and (when a root is shared) the folder's
+# user-declared .qsroutes.json routes - in deterministic (sorted) order, de-duplicated.
+# Both tables key on "METHOD /path". Mirrors qsHttpAllow(pPath, pRoot).
 
-def http_allow(route_keys, path):
+def http_allow(route_keys, path, user_keys=None):
+    keys = list(route_keys) + list(user_keys or [])
     extras = sorted({
         k.split(" ", 1)[0]
-        for k in route_keys
+        for k in keys
         if " " in k and k.split(" ", 1)[1] == path
         and k.split(" ", 1)[0] not in ("GET", "HEAD", "OPTIONS")
     })
@@ -924,6 +927,17 @@ def main():
     check("http_allow multi",
           http_allow(["POST /x", "PUT /x", "DELETE /x", "GET /x"], "/x"),
           "GET, HEAD, OPTIONS, DELETE, POST, PUT")
+    # user-declared (.qsroutes.json) methods merge in, de-duplicated with the built-in table
+    _uroutes = ["POST /api/submit", "GET /api/hello", "PUT /api/submit"]
+    for path, want in [
+        ("/api/submit", "GET, HEAD, OPTIONS, POST, PUT"),   # two user methods, sorted
+        ("/api/hello", "GET, HEAD, OPTIONS"),               # a GET user route dedups away
+        ("/nope", "GET, HEAD, OPTIONS"),                    # no user route for this path
+    ]:
+        check("http_allow user(%r)" % path, http_allow([], path, _uroutes), want)
+    # a method present in BOTH tables appears once (dedup across tables)
+    check("http_allow dedup-cross",
+          http_allow(["POST /dup"], "/dup", ["POST /dup"]), "GET, HEAD, OPTIONS, POST")
 
     # -- editor login brute-force backoff --
     for fails, last_ms, now_ms, want in [
