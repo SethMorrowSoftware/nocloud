@@ -3663,6 +3663,109 @@ command qsHttpReply pConn, pCode, pType, pBody, pExtra
    end if
 end qsHttpReply
 
+-- Transport-neutral streaming file server: dispatch to the onion or clearweb server by the
+-- connection tag, exactly as qsHttpReply does for text. Lets the shared serve pipeline
+-- (qsHttpServeStatic) stay transport-blind.
+command qsServeFile pConn, pDisk, pForMime, pHeaders
+   local tKind, tId
+   put char 1 to 3 of pConn into tKind
+   put char 4 to -1 of pConn into tId
+   if tKind is "ox:" then
+      qsFsServeFile tId, pDisk, pForMime, pHeaders
+   else
+      qsCwServeFile tId, pDisk, pForMime, pHeaders
+   end if
+end qsServeFile
+
+-- Transport-neutral 301-ish directory redirect (append the missing trailing slash), by tag.
+command qsSendRedirect pConn, pLocation
+   local tKind, tId
+   put char 1 to 3 of pConn into tKind
+   put char 4 to -1 of pConn into tId
+   if tKind is "ox:" then
+      qsFsSendRedirect tId, pLocation
+   else
+      qsCwSendRedirect tId, pLocation
+   end if
+end qsSendRedirect
+
+-- Shared route layer for BOTH transports: a registered dynamic route answers first (any method),
+-- then a .qsroutes.json route, then an OPTIONS preflight/Allow, then a 405 for an unsupported
+-- method. Reports (via `the result`) "true" when it answered - the caller then stops - or "false"
+-- to fall through to the static pipeline. pConn is "ox:<id>"/"cw:<id>"; pAppPath is the decoded,
+-- app-relative path; pRoot is THIS share's folder (for its user routes). This is the block that
+-- used to be copied verbatim into qsFsServePath AND qsCwServe.
+command qsHttpTryRoutes pConn, pAppPath, pRoot, pHeaders
+   local tMethod, tRouteKey, tAllow, tCrlf
+   put (numToChar(13) & numToChar(10)) into tCrlf
+   put pHeaders["__method"] into tMethod
+   put toUpper(tMethod) & space & pAppPath into tRouteKey
+   if sHttpRoutes[tRouteKey] is not empty then
+      put pAppPath into pHeaders["__path"]              -- hand the handler the decoded path
+      qsHttpDispatch pConn, sHttpRoutes[tRouteKey], pHeaders
+      return "true"
+   end if
+   qsEnsureUserRoutes pRoot                             -- lazy-load this folder's .qsroutes.json
+   if sUserRoutes[pRoot][tRouteKey] is an array then
+      qsUserRouteDispatch pConn, sUserRoutes[pRoot][tRouteKey], pHeaders, pRoot
+      return "true"
+   end if
+   if tMethod is "OPTIONS" then
+      put qsHttpAllow(pAppPath, pRoot) into tAllow
+      qsHttpReply pConn, 200, "text/plain; charset=utf-8", "", \
+         ("Allow: " & tAllow & tCrlf & qsCorsPreflight(pRoot, pAppPath, tAllow))
+      return "true"
+   end if
+   if tMethod is not "GET" and tMethod is not "HEAD" then
+      qsHttpReply pConn, 405, "text/plain; charset=utf-8", "Method not allowed.", \
+         ("Allow: " & qsHttpAllow(pAppPath, pRoot) & tCrlf)
+      return "true"
+   end if
+   return "false"
+end qsHttpTryRoutes
+
+-- Shared static GET/HEAD pipeline for BOTH transports (used once the route layer declined): a
+-- 503 if no folder is shared, then dotfiles are invisible, then a directory serves its
+-- index.html (or a listing) with a trailing-slash redirect, then a plain file, then an SPA
+-- fallback to index.html, else a 404. pRawPath is the still-%xx-encoded path (for the redirect
+-- Location). Every reply goes through a transport-neutral sender. This is the other block that
+-- used to be duplicated across qsFsServePath and qsCwServe.
+command qsHttpServeStatic pConn, pAppPath, pRawPath, pRoot, pHeaders
+   local tDisk, tIndex, tSpa
+   if pRoot is empty then
+      qsHttpReply pConn, 503, "text/plain; charset=utf-8", "No folder is being shared."
+      exit qsHttpServeStatic
+   end if
+   if qsHasDotSegment(pAppPath) then
+      qsHttpReply pConn, 404, "text/html; charset=utf-8", qsFsNotFound(pAppPath)
+      exit qsHttpServeStatic
+   end if
+   put pRoot & pAppPath into tDisk
+   if there is a folder tDisk then
+      if the last char of pAppPath is not "/" then
+         qsSendRedirect pConn, (pRawPath & "/")
+         exit qsHttpServeStatic
+      end if
+      put tDisk & "index.html" into tIndex             -- tDisk ends with "/" here
+      if there is a file tIndex then
+         qsServeFile pConn, tIndex, "index.html", pHeaders
+      else
+         qsHttpReply pConn, 200, "text/html; charset=utf-8", qsFsListing(tDisk, pAppPath)
+      end if
+      exit qsHttpServeStatic
+   end if
+   if there is a file tDisk then
+      qsServeFile pConn, tDisk, pAppPath, pHeaders
+      exit qsHttpServeStatic
+   end if
+   put qsSiteSpaTarget(pRoot, pAppPath) into tSpa       -- unresolved -> SPA fallback, else 404
+   if tSpa is not empty then
+      qsServeFile pConn, tSpa, "index.html", pHeaders
+   else
+      qsHttpReply pConn, 404, "text/html; charset=utf-8", qsFsNotFound(pAppPath)
+   end if
+end qsHttpServeStatic
+
 function qsHttpReason pCode
    if pCode is 200 then
       return "OK"
@@ -3698,6 +3801,8 @@ function qsHttpReason pCode
       return "Too Many Requests"
    else if pCode is 500 then
       return "Internal Server Error"
+   else if pCode is 503 then
+      return "Service Unavailable"
    end if
    return "OK"
 end qsHttpReason
@@ -4866,12 +4971,13 @@ function qsEditHtml
       "})();</script></body></html>")
 end qsEditHtml
 
--- Route: a folder (listing or its index.html, with a trailing-slash redirect), a
--- file (streamed, Range-aware), else 404. Only GET/HEAD; ".." refused.
+-- Tor prologue: the transport-specific front of the serve pipeline. Tor hands us a pre-parsed
+-- request and always closes the stream, so there is no keep-alive decision and no capability
+-- token - the onion root IS the share. Decode, guard (traversal / control / unframeable), log,
+-- then hand off to the SHARED route + static pipeline (appPath = the whole decoded path, since
+-- Tor serves at the folder root). Mirrored by qsCwServe's prologue.
 command qsFsServePath pStream, pHeaders
-   local tRaw, tPath, tDisk, tIndex, tMethod, tRoot, tSpa, tRouteKey, tCrlf, tAllow
-   put (numToChar(13) & numToChar(10)) into tCrlf
-   put pHeaders["__method"] into tMethod
+   local tRaw, tPath, tConn
    put pHeaders["__path"] into tRaw          -- still %xx-encoded; used for the redirect Location
    put urlDecode(tRaw) into tPath            -- real chars for disk mapping
    if tPath is empty then
@@ -4893,69 +4999,15 @@ command qsFsServePath pStream, pHeaders
       qsFsSendText pStream, "400 Bad Request", "text/plain; charset=utf-8", "Unsupported request framing."
       exit qsFsServePath
    end if
-   qsAccessLog "via Tor", tMethod, tPath
-   -- a registered dynamic route answers FIRST (any method, so a POST works); only
-   -- then does the static GET/HEAD pipeline apply. Hand the handler the decoded path.
-   put toUpper(tMethod) & space & tPath into tRouteKey
-   if sHttpRoutes[tRouteKey] is not empty then
-      put tPath into pHeaders["__path"]
-      qsHttpDispatch ("ox:" & pStream), sHttpRoutes[tRouteKey], pHeaders
+   qsAccessLog "via Tor", pHeaders["__method"], tPath
+   -- shared pipeline: a dynamic/user route answers first, else the static GET/HEAD pipeline. Use
+   -- the Tor share's OWN root (not qsShareRoot(), which would pick a concurrent clearweb folder).
+   put ("ox:" & pStream) into tConn
+   qsHttpTryRoutes tConn, tPath, sActiveShare["root"], pHeaders
+   if the result is "true" then
       exit qsFsServePath
    end if
-   -- then a user-declared route from the shared folder's .qsroutes.json (use the Tor share's
-   -- OWN root, not qsShareRoot(), which would pick a concurrent clearweb share's folder)
-   qsEnsureUserRoutes sActiveShare["root"]
-   if sUserRoutes[sActiveShare["root"]][tRouteKey] is an array then
-      qsUserRouteDispatch ("ox:" & pStream), sUserRoutes[sActiveShare["root"]][tRouteKey], pHeaders, sActiveShare["root"]
-      exit qsFsServePath
-   end if
-   if tMethod is "OPTIONS" then
-      -- 200 with an empty body (not 204: a 204 must not carry Content-Length, which the
-      -- shared text sender always sets). Advertise the methods this path accepts.
-      put qsHttpAllow(tPath, sActiveShare["root"]) into tAllow
-      qsFsSendText pStream, "200 OK", "text/plain; charset=utf-8", "", \
-         ("Allow: " & tAllow & tCrlf & qsCorsPreflight(sActiveShare["root"], tPath, tAllow))
-      exit qsFsServePath
-   end if
-   if tMethod is not "GET" and tMethod is not "HEAD" then
-      qsFsSendText pStream, "405 Method Not Allowed", "text/plain; charset=utf-8", "Method not allowed.", ("Allow: " & qsHttpAllow(tPath, sActiveShare["root"]) & tCrlf)
-      exit qsFsServePath
-   end if
-   put sActiveShare["root"] into tRoot
-   if tRoot is empty then
-      qsFsSendText pStream, "503 Service Unavailable", "text/plain; charset=utf-8", "No folder is being shared."
-      exit qsFsServePath
-   end if
-   -- dotfiles are invisible to the static pipeline (see qsHasDotSegment)
-   if qsHasDotSegment(tPath) then
-      qsFsSendText pStream, "404 Not Found", "text/html; charset=utf-8", qsFsNotFound(tPath)
-      exit qsFsServePath
-   end if
-   put tRoot & tPath into tDisk
-   if there is a folder tDisk then
-      if the last char of tPath is not "/" then
-         qsFsSendRedirect pStream, (tRaw & "/")
-         exit qsFsServePath
-      end if
-      put tDisk & "index.html" into tIndex    -- tDisk ends with "/" here
-      if there is a file tIndex then
-         qsFsServeFile pStream, tIndex, "index.html", pHeaders
-      else
-         qsFsSendText pStream, "200 OK", "text/html; charset=utf-8", qsFsListing(tDisk, tPath)
-      end if
-      exit qsFsServePath
-   end if
-   if there is a file tDisk then
-      qsFsServeFile pStream, tDisk, tPath, pHeaders
-      exit qsFsServePath
-   end if
-   -- unresolved: a SPA route falls back to index.html; otherwise a real 404
-   put qsSiteSpaTarget(tRoot, tPath) into tSpa
-   if tSpa is not empty then
-      qsFsServeFile pStream, tSpa, "index.html", pHeaders
-   else
-      qsFsSendText pStream, "404 Not Found", "text/html; charset=utf-8", qsFsNotFound(tPath)
-   end if
+   qsHttpServeStatic tConn, tPath, tRaw, sActiveShare["root"], pHeaders
 end qsFsServePath
 
 -- Response headers added to EVERYTHING we serve (both transports), as CRLF-terminated
@@ -5902,9 +5954,12 @@ end qsCwData
 
 -- Parse, check the capability token (the first path segment), then route: for a file
 -- share only the one file is reachable; for a folder share, browse within the root.
+-- Clearweb prologue: the transport-specific front of the serve pipeline. Unlike Tor, clearweb
+-- parses the request itself, decides keep-alive, and gates on the /<token>/ capability segment;
+-- it can also be a SINGLE-FILE share. Once decoded and token-stripped it hands off to the SAME
+-- shared route + static pipeline as Tor (appPath = the token-stripped path). Mirrors qsFsServePath.
 command qsCwServe pSocketID
-   local tHeaders, tMethod, tRaw, tPath, tTok, tRest, tDisk, tIndex, tSavedID, tSpa, tRouteKey, tCrlf, tAllow
-   put (numToChar(13) & numToChar(10)) into tCrlf
+   local tHeaders, tMethod, tRaw, tPath, tTok, tRest, tSavedID, tConn
    put qsHttpParse(sCwReq[pSocketID]) into tHeaders
    put tHeaders["__method"] into tMethod
    put tMethod into sCwMethod[pSocketID]   -- a HEAD reply must carry no body (qsCwSendText)
@@ -5941,6 +5996,9 @@ command qsCwServe pSocketID
       exit qsCwServe
    end if
    qsAccessLog qsCwPeer(pSocketID), tMethod, tPath
+   -- capability token: the first path segment must equal the share token, else 404 (an open
+   -- port must not be an open directory). The rest ("/..." with the token stripped) is the
+   -- app-relative path handed to the shared pipeline, so a route is transport-neutral.
    put the itemDelimiter into tSavedID
    set the itemDelimiter to "/"
    put item 2 of tPath into tTok            -- /<token>/... ; item 1 is "" (leading /)
@@ -5954,34 +6012,16 @@ command qsCwServe pSocketID
       qsCwSendText pSocketID, "404 Not Found", "text/plain; charset=utf-8", "Not found."
       exit qsCwServe
    end if
-   -- a registered dynamic route (under the token) answers FIRST, any method. Give the
-   -- handler the app-relative path (token stripped) so a route is transport-neutral.
-   put toUpper(tMethod) & space & tRest into tRouteKey
-   if sHttpRoutes[tRouteKey] is not empty then
-      put tRest into tHeaders["__path"]
-      qsHttpDispatch ("cw:" & pSocketID), sHttpRoutes[tRouteKey], tHeaders
-      exit qsCwServe
-   end if
-   -- then a user-declared route from the shared folder's .qsroutes.json
-   qsEnsureUserRoutes sCwRoot
-   if sUserRoutes[sCwRoot][tRouteKey] is an array then
-      qsUserRouteDispatch ("cw:" & pSocketID), sUserRoutes[sCwRoot][tRouteKey], tHeaders, sCwRoot
-      exit qsCwServe
-   end if
-   if tMethod is "OPTIONS" then
-      -- 200 + empty body (not 204: a 204 must not carry the Content-Length the shared
-      -- sender always sets); keep-alive stays clean since the body is empty.
-      put qsHttpAllow(tRest, sCwRoot) into tAllow
-      qsCwSendText pSocketID, "200 OK", "text/plain; charset=utf-8", "", \
-         ("Allow: " & tAllow & tCrlf & qsCorsPreflight(sCwRoot, tRest, tAllow))
-      exit qsCwServe
-   end if
-   if tMethod is not "GET" and tMethod is not "HEAD" then
-      qsCwSendText pSocketID, "405 Method Not Allowed", "text/plain; charset=utf-8", "Method not allowed.", ("Allow: " & qsHttpAllow(tRest, sCwRoot) & tCrlf)
+   -- shared route layer FIRST (any method), so /_qs/* and OPTIONS work even for a single-file
+   -- share - exactly as before the two paths were unified.
+   put ("cw:" & pSocketID) into tConn
+   qsHttpTryRoutes tConn, tRest, sCwRoot, tHeaders
+   if the result is "true" then
       exit qsCwServe
    end if
    if sCwKind is "file" then
-      -- only the one shared file is reachable: "/<token>/" or "/<token>/<name>"
+      -- single-file share: only the one file is reachable ("/<token>/" or "/<token>/<name>"), no
+      -- folder pipeline (a dotfile explicitly chosen as the shared file is served on purpose).
       if tRest is "/" or tRest is ("/" & sCwFileName) then
          qsCwServeFile pSocketID, sCwFilePath, sCwFileName, tHeaders
       else
@@ -5989,38 +6029,8 @@ command qsCwServe pSocketID
       end if
       exit qsCwServe
    end if
-   -- folder share: route tRest within sCwRoot (mirrors qsFsServePath). Dotfiles
-   -- are invisible here (qsHasDotSegment); the single-FILE share above is exempt
-   -- on purpose - explicitly choosing a dotfile to share is the sharer's intent.
-   if qsHasDotSegment(tRest) then
-      qsCwSendText pSocketID, "404 Not Found", "text/html; charset=utf-8", qsFsNotFound(tRest)
-      exit qsCwServe
-   end if
-   put sCwRoot & tRest into tDisk
-   if there is a folder tDisk then
-      if the last char of tRest is not "/" then
-         qsCwSendRedirect pSocketID, (tRaw & "/")
-         exit qsCwServe
-      end if
-      put tDisk & "index.html" into tIndex
-      if there is a file tIndex then
-         qsCwServeFile pSocketID, tIndex, "index.html", tHeaders
-      else
-         qsCwSendText pSocketID, "200 OK", "text/html; charset=utf-8", qsFsListing(tDisk, tRest)
-      end if
-      exit qsCwServe
-   end if
-   if there is a file tDisk then
-      qsCwServeFile pSocketID, tDisk, tRest, tHeaders
-      exit qsCwServe
-   end if
-   -- unresolved: a SPA route falls back to index.html; otherwise a real 404
-   put qsSiteSpaTarget(sCwRoot, tRest) into tSpa
-   if tSpa is not empty then
-      qsCwServeFile pSocketID, tSpa, "index.html", tHeaders
-   else
-      qsCwSendText pSocketID, "404 Not Found", "text/html; charset=utf-8", qsFsNotFound(tRest)
-   end if
+   -- folder share: the SAME static pipeline Tor uses, within sCwRoot
+   qsHttpServeStatic tConn, tRest, tRaw, sCwRoot, tHeaders
 end qsCwServe
 
 -- Serve a file over the socket: size it, honour a Range, write the head, then pump the
