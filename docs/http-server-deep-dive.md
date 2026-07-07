@@ -16,7 +16,9 @@
 > response (`Referrer-Policy: no-referrer`, `X-Frame-Options: DENY`, `X-Robots-Tag: noindex`,
 > `Permissions-Policy: browsing-topics=()`) and a read-only **`GET /_qs/routes`** listing the
 > active custom routes (method/path/kind only); the `Allow` header on `OPTIONS`/`405` now also
-> reflects user-declared route methods, and the editor-login `429` carries a `Retry-After`.
+> reflects user-declared route methods; the editor-login `429` carries a `Retry-After`; and a
+> `cors: true` route now also answers the `OPTIONS` **CORS preflight** (so preflighted
+> cross-origin requests, not just simple GETs, work).
 > Still open: conditional GET (`ETag`/`304`) — held back because a correct ETag wants a cheap
 > per-file mtime the engine only exposes via a directory scan (against the one-stat-per-request
 > rule) — plus a shared clearweb/Tor serve core and first-class per-route streaming/params.

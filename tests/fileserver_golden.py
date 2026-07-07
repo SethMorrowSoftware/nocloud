@@ -509,6 +509,21 @@ def http_allow(route_keys, path, user_keys=None):
     return ", ".join(["GET", "HEAD", "OPTIONS"] + extras)
 
 
+# ---- qsCorsPreflight: the CORS header block for an OPTIONS preflight ----------
+# Empty unless some user route on `path` opted into cors; else the four Access-Control-*
+# lines (Allow-Methods reuses the already-computed Allow value). `cors_keys` = the set of
+# "METHOD /path" keys whose route set cors:true. Mirrors qsCorsPreflight.
+
+def cors_preflight(cors_keys, path, allow):
+    for k in cors_keys:
+        if " " in k and k.split(" ", 1)[1] == path:
+            return ("Access-Control-Allow-Origin: *\r\n"
+                    "Access-Control-Allow-Methods: " + allow + "\r\n"
+                    "Access-Control-Allow-Headers: *\r\n"
+                    "Access-Control-Max-Age: 600\r\n")
+    return ""
+
+
 # ---- qsEditLoginWait: editor login brute-force backoff -----------------------
 # ms this peer must still wait before another attempt. First _EDIT_FREE_TRIES fails are
 # free; after that the required gap doubles each fail, capped. Constants mirror the kEdit*
@@ -939,6 +954,17 @@ def main():
     check("http_allow dedup-cross",
           http_allow(["POST /dup"], "/dup", ["POST /dup"]), "GET, HEAD, OPTIONS, POST")
 
+    # -- CORS preflight block: only when a cors route exists on the path --
+    _cors_keys = ["POST /api/submit", "GET /api/open"]
+    _pf = ("Access-Control-Allow-Origin: *\r\n"
+           "Access-Control-Allow-Methods: GET, HEAD, OPTIONS, POST\r\n"
+           "Access-Control-Allow-Headers: *\r\n"
+           "Access-Control-Max-Age: 600\r\n")
+    check("cors_preflight match",
+          cors_preflight(_cors_keys, "/api/submit", "GET, HEAD, OPTIONS, POST"), _pf)
+    check("cors_preflight no-cors-route", cors_preflight(_cors_keys, "/api/other", "GET, HEAD, OPTIONS"), "")
+    check("cors_preflight empty", cors_preflight([], "/api/submit", "GET, HEAD, OPTIONS"), "")
+
     # -- editor login brute-force backoff --
     for fails, last_ms, now_ms, want in [
         (0, None, 1000, 0),                     # first attempt: free
@@ -1041,7 +1067,7 @@ def main():
           "length, JSON escape, editor confinement, LAN-first gate, query parse, size "
           "probe, filename sanitise, rate + ETA format, HTTP-date, Allow header, "
           "editor login backoff, user-route path + header sanitise, template render + "
-          "escape all match)")
+          "escape, CORS preflight all match)")
     return 0
 
 

@@ -78,7 +78,7 @@ reflects that back as `{"method":"GET","you_said":"hi"}`; `GET /api/config` stre
 | `type` | `Content-Type` for a `body` or `file` response. For a file, omit to derive it from the extension. | `text/plain; charset=utf-8` |
 | `status` | HTTP status code. | `200` (body) / `302` (redirect) |
 | `redirect` | If present, the route becomes a redirect to this `Location`. `status` may be `301/302/303/307/308`. | — |
-| `cors` | `true` adds `Access-Control-Allow-Origin: *` (so other pages/tools may fetch it). | `false` |
+| `cors` | `true` adds `Access-Control-Allow-Origin: *` (so other pages/tools may fetch it), and makes an `OPTIONS` preflight to the path answer with the `Access-Control-Allow-*` headers, so even a preflighted cross-origin request (POST+JSON, `PUT`/`DELETE`, custom headers) works. | `false` |
 | `headers` | An object of extra response headers. Names are limited to letters/digits/`-`; CR/LF/control bytes are stripped from values; framing/server-owned headers (`Content-Length`, `Connection`, `Content-Type`, `Location`, `Date`, …) can't be overridden. | — |
 
 A route needs exactly one of `body` (default), `file`, or `redirect`; if more than one is
