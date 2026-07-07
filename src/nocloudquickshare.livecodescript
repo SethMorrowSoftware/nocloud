@@ -257,6 +257,8 @@ constant kEditVerify = "BTXEDIT1"      -- plaintext sealed under the edit key to
 constant kEditMaxDepth = 32            -- editor file listing: recursion depth ceiling (anti-loop)
 constant kEditMaxFileBytes = 262144    -- editor: biggest file it will read/save (256 KB; a save
                                        -- is additionally bounded by kFsMaxReq at the transport)
+constant kEditMaxUploadBytes = 1073741824  -- editor: total-size ceiling for a CHUNKED upload
+                                       -- (write + appends; 1 GiB - a footgun guard, not a quota)
 constant kEditFreeTries = 4            -- editor login: failed attempts allowed before throttling
 constant kEditLockBaseMs = 1000        -- editor login: base backoff after the free tries (doubles/fail)
 constant kEditLockCapMs = 30000        -- editor login: backoff ceiling (30 s)
@@ -1077,6 +1079,8 @@ command qsStart
    qsHttpRoute "GET", "/_edit/api/list", "qsEditListRoute"
    qsHttpRoute "GET", "/_edit/api/read", "qsEditReadRoute"
    qsHttpRoute "PUT", "/_edit/api/write", "qsEditWriteRoute"
+   qsHttpRoute "PUT", "/_edit/api/append", "qsEditAppendRoute"
+   qsHttpRoute "POST", "/_edit/api/delete", "qsEditDeleteRoute"
    if sHasOnion then
       qsOnionStart
    else
@@ -4826,6 +4830,15 @@ command qsEditWriteRoute pConn, pRequest
       qsHttpReply pConn, 400, "text/plain; charset=utf-8", "Bad path."
       exit qsEditWriteRoute
    end if
+   -- refuse CREATING a hidden (dot-leading) file or folder: those are invisible to the folder
+   -- listing and to visitors, so writing one is a footgun, and a nested dotfolder could house a
+   -- server-significant dotfile (e.g. .qsroutes.json). This also rejects a trailing "." segment
+   -- (which qsEditParentDirs would otherwise mis-treat as a folder). Editing an EXISTING dotfile
+   -- via /_edit is unchanged; only creating a new hidden PATH is blocked.
+   if qsHasDotSegment(tRel) then
+      qsHttpReply pConn, 400, "text/plain; charset=utf-8", "Hidden (dot) paths cannot be written through the editor."
+      exit qsEditWriteRoute
+   end if
    if there is a folder tDisk then
       qsHttpReply pConn, 409, "text/plain; charset=utf-8", "That path is a folder."
       exit qsEditWriteRoute
@@ -4835,6 +4848,9 @@ command qsEditWriteRoute pConn, pRequest
       qsHttpReply pConn, 413, "text/plain; charset=utf-8", "That file is too large to save through the editor."
       exit qsEditWriteRoute
    end if
+   -- a save may target a folder that does not exist yet (e.g. assets/uploads/...):
+   -- create the missing parent levels first, so uploads can organise themselves
+   qsEditEnsureFolders qsEditServedRoot(), tRel
    -- REPLACE the file wholesale. `open file ... for binary write` does NOT truncate in
    -- this engine (it overwrites from offset 0 and leaves any longer tail in place), so
    -- saving a SHORTER file would otherwise keep stale trailing bytes. Delete first - the
@@ -4857,6 +4873,159 @@ command qsEditWriteRoute pConn, pRequest
    add 1 to sEditGen             -- a live edit invalidates every weak ETag -> caches revalidate
    qsHttpReply pConn, 200, "text/plain; charset=utf-8", "Saved."
 end qsEditWriteRoute
+
+-- PUT /_edit/api/append?path=REL : append the request body to the file (created if absent).
+-- The chunked half of an UPLOAD: a client sends the FIRST slice to /_edit/api/write (which
+-- creates/truncates) and every further slice here, so a file bigger than the per-request
+-- transport cap (kFsMaxReq) arrives in bounded pieces - the download path's fixed-slice
+-- discipline, in reverse. Auth required; the path is confined by qsEditSafePath; the file's
+-- TOTAL size is capped by kEditMaxUploadBytes (each slice is already capped by kFsMaxReq).
+command qsEditAppendRoute pConn, pRequest
+   local tRel, tDisk, tBody, tErr, tSize
+   if not qsEditAuthed(pConn, pRequest) then
+      qsEditDeny pConn
+      exit qsEditAppendRoute
+   end if
+   put qsQueryParam(pRequest["__query"], "path") into tRel
+   put qsEditSafePath(qsEditServedRoot(), tRel) into tDisk
+   if tDisk is empty then
+      qsHttpReply pConn, 400, "text/plain; charset=utf-8", "Bad path."
+      exit qsEditAppendRoute
+   end if
+   if qsHasDotSegment(tRel) then          -- no creating/growing a hidden path (see qsEditWriteRoute)
+      qsHttpReply pConn, 400, "text/plain; charset=utf-8", "Hidden (dot) paths cannot be written through the editor."
+      exit qsEditAppendRoute
+   end if
+   if there is a folder tDisk then
+      qsHttpReply pConn, 409, "text/plain; charset=utf-8", "That path is a folder."
+      exit qsEditAppendRoute
+   end if
+   put pRequest["__body"] into tBody
+   -- qsFileSize returns empty for an ABSENT file (fine: the first slice starts from 0) but ALSO
+   -- for an existing-but-unsizable one (unreadable, or beyond the 8 GiB size-probe ceiling).
+   -- Treat only a genuinely absent file as size 0; refuse when a file exists but cannot be
+   -- measured, so the total-size cap is never silently under-counted.
+   put qsFileSize(tDisk) into tSize
+   if tSize is empty then
+      if there is a file tDisk then
+         qsHttpReply pConn, 409, "text/plain; charset=utf-8", "Could not size the existing file to check the upload cap."
+         exit qsEditAppendRoute
+      end if
+      put 0 into tSize
+   end if
+   if tSize + (the number of bytes in tBody) > kEditMaxUploadBytes then
+      qsHttpReply pConn, 413, "text/plain; charset=utf-8", "That upload is too large."
+      exit qsEditAppendRoute
+   end if
+   qsEditEnsureFolders qsEditServedRoot(), tRel
+   open file tDisk for binary append
+   if the result is not empty then
+      qsHttpReply pConn, 500, "text/plain; charset=utf-8", "Could not open the file for appending."
+      exit qsEditAppendRoute
+   end if
+   write tBody to file tDisk
+   put the result into tErr
+   close file tDisk
+   if tErr is not empty then
+      qsHttpReply pConn, 500, "text/plain; charset=utf-8", ("Append failed: " & tErr)
+      exit qsEditAppendRoute
+   end if
+   add 1 to sEditGen             -- growing a file invalidates its weak ETag too
+   qsHttpReply pConn, 200, "text/plain; charset=utf-8", "Appended."
+end qsEditAppendRoute
+
+-- POST /_edit/api/delete?path=REL : delete ONE file. Auth required; the path is confined by
+-- qsEditSafePath; a folder is refused (the dangerous verb is deliberately file-only and
+-- non-recursive - removing a tree stays a job for the machine's own file manager).
+command qsEditDeleteRoute pConn, pRequest
+   local tRel, tDisk
+   if not qsEditAuthed(pConn, pRequest) then
+      qsEditDeny pConn
+      exit qsEditDeleteRoute
+   end if
+   put qsQueryParam(pRequest["__query"], "path") into tRel
+   put qsEditSafePath(qsEditServedRoot(), tRel) into tDisk
+   if tDisk is empty then
+      qsHttpReply pConn, 400, "text/plain; charset=utf-8", "Bad path."
+      exit qsEditDeleteRoute
+   end if
+   if there is a folder tDisk then
+      qsHttpReply pConn, 409, "text/plain; charset=utf-8", "That path is a folder."
+      exit qsEditDeleteRoute
+   end if
+   if there is no file tDisk then
+      qsHttpReply pConn, 404, "text/plain; charset=utf-8", "No such file."
+      exit qsEditDeleteRoute
+   end if
+   delete file tDisk
+   if the result is not empty then
+      qsHttpReply pConn, 500, "text/plain; charset=utf-8", "Could not delete the file."
+      exit qsEditDeleteRoute
+   end if
+   add 1 to sEditGen             -- the file is gone: revalidations must not 304 a ghost
+   qsHttpReply pConn, 200, "text/plain; charset=utf-8", "Deleted."
+end qsEditDeleteRoute
+
+-- The chain of PARENT folders (forward-slash relative paths, one per line, outermost first)
+-- that must exist before REL can be created: "a/b/c.png" -> "a" then "a/b"; a root-level
+-- file -> empty. The leaf (the file) is the LAST segment AFTER dropping empty and "." segments,
+-- so it matches qsEditSafePath's own leaf exactly - a trailing "/", "/.", or "//" can never turn
+-- the real leaf into a folder (which would make the write open a directory and fail). Pure;
+-- golden: edit_parent_dirs(). Call it only on a path qsEditSafePath has already accepted.
+function qsEditParentDirs pRel
+   local tRel, tSeg, tClean, tCur, tOut, tSavedID, tCount, tI
+   put pRel into tRel
+   replace "\" with "/" in tRel
+   put the itemDelimiter into tSavedID
+   set the itemDelimiter to "/"
+   put "" into tClean                       -- the real segments (empties and "." dropped)
+   repeat for each item tSeg in tRel
+      if tSeg is not empty and tSeg is not "." then
+         put tSeg & return after tClean
+      end if
+   end repeat
+   set the itemDelimiter to tSavedID
+   if the last char of tClean is return then
+      delete the last char of tClean
+   end if
+   put the number of lines of tClean into tCount
+   put "" into tOut
+   put "" into tCur
+   put 0 into tI
+   repeat for each line tSeg in tClean
+      add 1 to tI
+      if tI is tCount then
+         exit repeat                        -- the last real segment is the file itself
+      end if
+      if tCur is empty then
+         put tSeg into tCur
+      else
+         put tCur & "/" & tSeg into tCur
+      end if
+      put tCur & return after tOut
+   end repeat
+   if the last char of tOut is return then
+      delete the last char of tOut
+   end if
+   return tOut
+end qsEditParentDirs
+
+-- Create any missing parent folders for REL under pRoot. Confined by construction:
+-- qsEditParentDirs only recombines REL's own vetted segments (REL already passed
+-- qsEditSafePath - no "..", ":", or control bytes survive to here). A no-op when
+-- every level exists; a create failure surfaces as the caller's open-for-write 500.
+command qsEditEnsureFolders pRoot, pRel
+   local tLine, tDir
+   repeat for each line tLine in qsEditParentDirs(pRel)
+      if tLine is empty then
+         next repeat
+      end if
+      put pRoot & "/" & tLine into tDir
+      if there is no folder tDir then
+         create folder tDir
+      end if
+   end repeat
+end qsEditEnsureFolders
 
 -- Every file under pRoot, as newline-separated forward-slash relative paths. Recursion
 -- is depth-bounded (kEditMaxDepth) so a directory symlink loop cannot run away.
