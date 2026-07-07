@@ -185,8 +185,11 @@
       '<circle class="pkt pkt-r" cx="180" cy="110" r="4" fill="#ec4899"/>' +
       '<circle class="pkt pkt-t" cx="180" cy="110" r="4" fill="#3b82f6"/>' +
       '<g class="qs-peer core">' +
-        '<rect x="150" y="84" width="60" height="50" rx="14" fill="url(#qsc)"/>' +
-        '<path d="M162 106h14l4-5h13" stroke="#fff" stroke-width="2" fill="none" opacity=".85"/>' +
+        '<rect x="168" y="92" width="18" height="22" rx="2.5" fill="#eef2ff" transform="rotate(-7 177 103)"/>' +  // files inside,
+        '<rect x="180" y="92" width="18" height="22" rx="2.5" fill="#c7d2fe" transform="rotate(6 189 103)"/>' +   // peeking out the top
+        '<path d="M150 130V98a4 4 0 0 1 4-4h17l6 7h29a4 4 0 0 1 4 4v25a4 4 0 0 1-4 4h-52a4 4 0 0 1-4-4Z" fill="url(#qsc)"/>' + // folder + tab
+        '<path d="M150 114v12a4 4 0 0 0 4 4h52a4 4 0 0 0 4-4v-12Z" fill="#fff" opacity=".09"/>' + // front pocket, lightened
+        '<path d="M150 114h60" stroke="#fff" stroke-width="1.4" opacity=".3"/>' + // pocket seam
       '</g>' +
       '<g class="qs-peer b"><circle cx="95" cy="225" r="17" fill="#0f1428" stroke="url(#qsg)" stroke-width="2.5"/><circle cx="95" cy="225" r="4.5" fill="#22d3ee"/></g>' +
       '<g class="qs-peer c"><circle cx="265" cy="225" r="17" fill="#0f1428" stroke="url(#qsg)" stroke-width="2.5"/><circle cx="265" cy="225" r="4.5" fill="#ec4899"/></g>' +
