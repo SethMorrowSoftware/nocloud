@@ -35,7 +35,8 @@
     { id: 'checkout', label: 'Checkout', hidden: true },   // reached from the cart, not the nav
     { id: 'blog',     label: 'Blog' },
     { id: 'backend',  label: 'Backend' },
-    { id: 'about',    label: 'About' }
+    { id: 'about',    label: 'About' },
+    { id: 'admin',    label: 'Admin', hidden: true }       // reached from the footer, not the nav
   ];
   var NAMED = ROUTES.map(function (r) { return r.id; }).filter(Boolean);
 
@@ -72,7 +73,8 @@
     bolt:    '<path d="M13 3L5 13.5h5.5L11 21l8-10.5h-5.5z" fill="currentColor" stroke="none"/>',
     shield:  '<path d="M12 3.5l7 3v5c0 5-3 7.5-7 9.5-4-2-7-4.5-7-9.5v-5z"/><path d="M9 12l2 2 4-4.5"/>',
     folder:  '<path d="M4 7.5h5l2 2h9v9.5H4z"/>',
-    cart:    '<path d="M3 4h2l2 11h10l2-8H6"/><circle cx="9" cy="19" r="1.3"/><circle cx="17" cy="19" r="1.3"/>'
+    cart:    '<path d="M3 4h2l2 11h10l2-8H6"/><circle cx="9" cy="19" r="1.3"/><circle cx="17" cy="19" r="1.3"/>',
+    upload:  '<path d="M12 19V9M8 12l4-4 4 4"/><path d="M5.5 4.5h13"/>'
   };
   function icon(name, cls) {
     return '<svg class="ic' + (cls ? ' ' + cls : '') + '" viewBox="0 0 24 24" aria-hidden="true">' +
@@ -767,7 +769,7 @@
       [secure ? 'ok' : 'q', 'Secure context', secure
         ? 'This page is a secure context, so features like service workers are allowed (typical over a Tor .onion).'
         : 'This page is NOT a secure context (plain http). Service workers and some Web APIs are blocked here; a Tor .onion would enable them.'],
-      ['q', 'Live editing', 'Turn on the LAN-only editor in Quick Share and open this folder with /_edit on the end to edit these files in the browser.']
+      ['q', 'Live editing + admin', 'Turn on the LAN-only editor in Quick Share and this site grows a real admin panel (the Admin link in the footer): manage the store, gallery and blog, and upload media, from the browser.']
     ];
     var list = rows.map(function (r) {
       return '<li><span class="dot ' + (r[0] === 'ok' ? '' : 'q') + '">' +
@@ -842,6 +844,548 @@
     }
   }
 
+  // ------------------------------------------------------------------- admin
+  // A real site-admin panel built ENTIRELY on the host's LAN-only live editor
+  // (/_edit/login + /_edit/api/*): manage the store, gallery and blog manifests
+  // and upload media - no cloud, no build step, no second server. The editor is
+  // password-gated, LAN-only and OFF by default, so over Tor / the public web /
+  // a static preview this page degrades to an honest explainer and the host
+  // answers 404 as if no editor existed.
+  var adm = { tab: 'store', doc: null, memTok: '' };
+  function admToken() {
+    try { return sessionStorage.getItem('qsEditTok') || adm.memTok; }
+    catch (e) { return adm.memTok; }
+  }
+  function admSetToken(t) {
+    adm.memTok = t || '';
+    try {
+      if (t) sessionStorage.setItem('qsEditTok', t);
+      else sessionStorage.removeItem('qsEditTok');
+    } catch (e) {}
+  }
+  function admApi(method, sub, body) {
+    return fetch(href('_edit/' + sub), {
+      method: method, headers: { 'x-edit-token': admToken() }, body: body
+    });
+  }
+  // Fresh (never-cached) manifest read: the admin must see what is ON DISK now,
+  // not what the page cached at boot.
+  function admFresh(file) {
+    return fetch(href(file), { cache: 'no-store' }).then(function (r) {
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      return r.json();
+    });
+  }
+  function admStatus(msg, kind) {
+    var el = document.getElementById('admstat');
+    if (!el) return;
+    el.textContent = msg || '';
+    el.className = 'adm-status' + (kind ? ' ' + kind : '');
+  }
+  function admErr(e) {
+    admStatus('That did not work: ' + (e && e.message ? e.message : e), 'err');
+  }
+  // A filename safe to write into the folder: ASCII word chars, dots and dashes
+  // only, and never dot-LEADING (the host hides dotfiles from visitors).
+  function admSafeName(name) {
+    var n = String(name || '').replace(/[^A-Za-z0-9._ -]/g, '-').replace(/ +/g, '-');
+    n = n.replace(/^[.-]+/, '');
+    return n || 'upload';
+  }
+  // Chunked upload: slice 1 goes to api/write (creates/truncates), every further
+  // slice to api/append - each safely under the host's 256 KB request cap, so a
+  // big video arrives in bounded pieces (the download path's fixed-slice
+  // discipline, in reverse). Returns a promise of the folder-relative path.
+  function admUpload(file, rel, bar) {
+    var CHUNK = 192 * 1024, off = 0;
+    if (bar) { bar.hidden = false; bar.max = file.size || 1; bar.value = 0; }
+    function step() {
+      var end = Math.min(off + CHUNK, file.size);
+      var api = (off === 0 ? 'api/write' : 'api/append') + '?path=' + encodeURIComponent(rel);
+      return admApi('PUT', api, file.slice(off, end)).then(function (r) {
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        off = end;
+        if (bar) bar.value = off;
+        return (off < file.size) ? step() : rel;
+      });
+    }
+    return step();
+  }
+  // Save a manifest: pretty JSON (diffable on disk), and drop the page's cached
+  // copy so the public views refetch the new content on their next visit.
+  function admSaveJson(file, doc) {
+    delete manifests[file];
+    return admApi('PUT', 'api/write?path=' + encodeURIComponent(file),
+      JSON.stringify(doc, null, 2) + '\n').then(function (r) {
+      if (r.status === 401 || r.status === 404) {
+        admSetToken(''); render(); throw new Error('signed out');
+      }
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      return true;
+    });
+  }
+
+  // What each content tab edits: the manifest file, its list key, and the form
+  // fields per item. "upload" fields pair a path input with a chunked uploader;
+  // "body" maps the blog's paragraph array to a blank-line-separated textarea.
+  var ADM_TABS = {
+    store: {
+      file: 'store.json', list: 'products', label: 'product', req: 'id',
+      site: [['shop', 'Shop name']],   // the store's intro copy is fixed; only the name renders
+      fields: [
+        { k: 'title', label: 'Title' },
+        { k: 'id', label: 'Id', hint: 'unique; letters and dashes' },
+        { k: 'blurb', label: 'Blurb', kind: 'textarea', wide: true },
+        { k: 'kind', label: 'Kind', hint: 'shown on the card, e.g. MP3 audio' },
+        { k: 'size', label: 'Size', hint: 'shown on the card, e.g. 0.5 MB' },
+        { k: 'price', label: 'Price', kind: 'number', hint: '0 shows as FREE' },
+        { k: 'image', label: 'Cover image', kind: 'upload' },
+        { k: 'file', label: 'Delivered file', kind: 'upload', hint: 'what the buyer downloads' }
+      ]
+    },
+    gallery: {
+      file: 'data.json', list: 'gallery', label: 'gallery piece',
+      // data.json's app/tagline are site-level (shown in the header brand, not on this page),
+      // so the gallery tab edits only its pieces - no misleading "site header" that does nothing.
+      fields: [
+        { k: 'title', label: 'Title' },
+        { k: 'file', label: 'Image', kind: 'upload' },
+        { k: 'note', label: 'Note', kind: 'textarea', wide: true }
+      ]
+    },
+    blog: {
+      file: 'blog.json', list: 'posts', label: 'post', req: 'slug',
+      site: [['blog', 'Blog name'], ['tagline', 'Tagline']],
+      fields: [
+        { k: 'title', label: 'Title' },
+        { k: 'slug', label: 'Slug', hint: 'the ?post= deep link; letters and dashes' },
+        { k: 'date', label: 'Date', hint: 'e.g. 2026-07-07' },
+        { k: 'minutes', label: 'Minutes to read', kind: 'number' },
+        { k: 'teaser', label: 'Teaser', kind: 'textarea', wide: true },
+        { k: 'body', label: 'Body', kind: 'body', wide: true, hint: 'plain text; blank line between paragraphs' }
+      ]
+    }
+  };
+
+  function vAdmin() {
+    return '<div class="card"><span class="kicker">Admin &middot; the live backend, writing</span>' +
+      '<h2>Site admin</h2>' +
+      '<p class="muted">Manage the store, gallery and blog of this very site, from this very site. ' +
+      'Every write goes through the host&rsquo;s <b>LAN-only, password-gated</b> live editor ' +
+      '(<kbd>/_edit</kbd>) &mdash; no cloud service, and none of it reachable from Tor or the ' +
+      'public internet.</p>' +
+      '<div id="admbody"><p class="muted">Looking for the live editor&hellip;</p></div></div>';
+  }
+  function wireAdmin() {
+    var body = document.getElementById('admbody');
+    if (!body) return;
+    // Reachability probe: an EMPTY login. A live, reachable editor answers 400
+    // ("Missing password") or 429 (throttled); everything else means no editor
+    // exists on this connection (Tor, public web, static preview, or off).
+    fetch(href('_edit/login'), { method: 'POST', body: '' }).then(function (r) {
+      if (r.status === 400 || r.status === 429) {
+        if (admToken()) admDash(); else admLogin();
+      } else {
+        admUnavailable();
+      }
+    }).catch(function () { admUnavailable(); });
+  }
+  function admUnavailable() {
+    document.getElementById('admbody').innerHTML = '<div class="adm-locked">' +
+      '<h3>' + icon('shield') + 'No editor on this connection &mdash; by design</h3>' +
+      '<p class="muted">The admin panel drives the host&rsquo;s live web editor, which only ' +
+      'exists when <b>all</b> of these are true:</p>' +
+      '<ul class="muted adm-list">' +
+      '<li>the folder is shared over a <b>direct web link</b> (never Tor &mdash; remote hands must not edit)</li>' +
+      '<li>you are on the <b>same local network</b> as the sharing machine</li>' +
+      '<li>the sharer turned the editor <b>on</b> and set a password (it ships off)</li>' +
+      '<li>the host has cryptoXT for the password check</li></ul>' +
+      '<p class="muted">Anywhere else this page is a shop window: you can see what the admin ' +
+      'does, and the host answers <kbd>404</kbd> as if no editor existed.</p></div>';
+  }
+  function admLogin(msg) {
+    var body = document.getElementById('admbody');
+    body.innerHTML = '<form class="adm-login" id="admform">' +
+      '<label class="field"><span>Edit password</span>' +
+      '<input class="input" id="admpass" type="password" autocomplete="current-password" required></label>' +
+      '<button class="btn" type="submit">' + icon('bolt') + 'Sign in</button>' +
+      (msg ? '<p class="adm-status err" role="alert">' + esc(msg) + '</p>' : '') +
+      '<p class="muted note">The password was set on the sharing machine when the editor was turned on. ' +
+      'Login is throttled against guessing; the session lives in this browser tab.</p></form>';
+    document.getElementById('admform').addEventListener('submit', function (ev) {
+      ev.preventDefault();
+      var pass = document.getElementById('admpass').value;
+      if (!pass) return;
+      fetch(href('_edit/login'), { method: 'POST', body: pass }).then(function (r) {
+        if (r.status === 429) {
+          var wait = r.headers.get('retry-after');
+          admLogin('Too many attempts - try again in ' + (wait || 'a few') + ' s.');
+          return;
+        }
+        if (!r.ok) { admLogin('Wrong password.'); return; }
+        r.text().then(function (tok) { admSetToken(tok.replace(/\s+/g, '')); admDash(); });
+      }).catch(function () { admLogin('Could not reach the editor.'); });
+    });
+    var pw = document.getElementById('admpass');
+    if (pw) pw.focus();
+  }
+  function admDash() {
+    var body = document.getElementById('admbody');
+    var tabs = ['store', 'gallery', 'blog', 'files'];
+    body.innerHTML = '<div class="adm-bar">' +
+      '<nav class="adm-tabs" role="tablist" aria-label="Admin sections">' +
+      tabs.map(function (t) {
+        var on = adm.tab === t;
+        return '<button class="adm-tab' + (on ? ' on' : '') + '" data-atab="' + t +
+          '" id="admtabbtn-' + t + '" role="tab" aria-controls="admtab" aria-selected="' +
+          (on ? 'true' : 'false') + '" tabindex="' + (on ? '0' : '-1') + '">' +
+          t.charAt(0).toUpperCase() + t.slice(1) + '</button>';
+      }).join('') + '</nav>' +
+      '<span class="adm-session">' + icon('check') + 'Signed in &middot; ' +
+      '<button class="linkbtn" id="admout" type="button">sign out</button></span></div>' +
+      '<p class="adm-status" id="admstat" role="status" aria-live="polite"></p>' +
+      '<div id="admtab" role="tabpanel" tabindex="0" aria-labelledby="admtabbtn-' + adm.tab +
+      '"><p class="muted">Loading&hellip;</p></div>';
+    var tabEls = Array.prototype.slice.call(body.querySelectorAll('[data-atab]'));
+    tabEls.forEach(function (b, bi) {
+      b.addEventListener('click', function () {
+        adm.tab = b.getAttribute('data-atab');
+        admDash();
+      });
+      // roving-tabindex arrow-key navigation, per the ARIA tabs pattern
+      b.addEventListener('keydown', function (ev) {
+        var d = ev.key === 'ArrowRight' ? 1 : ev.key === 'ArrowLeft' ? -1 : 0;
+        if (!d) return;
+        ev.preventDefault();
+        var next = tabEls[(bi + d + tabEls.length) % tabEls.length];
+        adm.tab = next.getAttribute('data-atab');
+        admDash();
+        var nb = document.getElementById('admtabbtn-' + adm.tab);
+        if (nb) nb.focus();
+      });
+    });
+    document.getElementById('admout').addEventListener('click', function () {
+      admSetToken('');
+      render();
+    });
+    if (adm.tab === 'files') admPaintFiles();
+    else admPaintManifest();
+  }
+
+  // ---- the three content tabs (store / gallery / blog): manifest CRUD --------
+  function admSummaryName(cfg, it) {
+    return it.title || it.slug || it.file || '(new ' + cfg.label + ')';
+  }
+  function admSiteForm(cfg, doc) {
+    return '<details class="adm-item"><summary><b>Site header</b>' +
+      '<span class="muted sum-note">' + esc(doc[cfg.site[0][0]] || '') + '</span></summary>' +
+      '<div class="adm-form">' +
+      cfg.site.map(function (s) {
+        return '<label class="field"><span>' + esc(s[1]) + '</span>' +
+          '<input class="input" data-sf="' + esc(s[0]) + '" value="' + esc(doc[s[0]] || '') + '"></label>';
+      }).join('') +
+      '<div class="adm-actions"><button type="button" class="btn sm" data-save="site">' +
+      icon('check') + 'Save</button></div></div></details>';
+  }
+  // A blog body is a list of typed blocks ({p}/{h}/{ul}/{code}); this simple editor only
+  // understands paragraphs. A body is "plain" (safely editable as text) only if every block is
+  // a lone {p}. A body with headings/lists/code is shown read-only and LEFT UNTOUCHED on save.
+  function admBodyPlain(body) {
+    return (body || []).every(function (b) {
+      return b && typeof b === 'object' && Object.keys(b).length === 1 && ('p' in b);
+    });
+  }
+  function admBodyPreview(body) {
+    return (body || []).map(function (b) {
+      if (b.h) return '## ' + b.h;
+      if (b.ul) return (b.ul || []).map(function (x) { return '- ' + x; }).join('\n');
+      if (b.code) return '```\n' + b.code + '\n```';
+      return b.p || '';
+    }).join('\n\n');
+  }
+  function admItemForm(cfg, it, i, open) {
+    var rows = cfg.fields.map(function (f) {
+      var v = it[f.k];
+      if (v === undefined || v === null) v = '';
+      var inner, extra = '';
+      if (f.kind === 'body') {
+        if (admBodyPlain(it.body)) {
+          v = (it.body || []).map(function (b) { return b.p || ''; }).join('\n\n');
+          inner = '<textarea class="input" data-f="' + esc(f.k) + '" rows="6">' + esc(v) + '</textarea>';
+        } else {
+          // rich body: read-only preview, NO data-f (so admReadItem leaves it.body intact)
+          inner = '<textarea class="input" rows="6" readonly aria-readonly="true">' +
+            esc(admBodyPreview(it.body)) + '</textarea>';
+          extra = ' <i class="hint">This post uses headings, lists or code. They are shown ' +
+            'read-only and kept exactly as-is on save; edit the raw JSON in the Files tab to change them.</i>';
+        }
+      } else if (f.kind === 'textarea') {
+        inner = '<textarea class="input" data-f="' + esc(f.k) + '" rows="4">' + esc(v) + '</textarea>';
+      } else if (f.kind === 'upload') {
+        inner = '<span class="upl"><input class="input" data-f="' + esc(f.k) + '" value="' + esc(v) + '">' +
+          '<button type="button" class="btn ghost sm" data-upl="' + esc(f.k) + '">Upload&hellip;</button></span>' +
+          '<input type="file" class="vh" data-uplfile="' + esc(f.k) + '" tabindex="-1" aria-label="Upload a file for ' + esc(f.label) + '">' +
+          '<progress class="upl-bar" data-uplbar="' + esc(f.k) + '" hidden></progress>';
+      } else {
+        inner = '<input class="input" data-f="' + esc(f.k) + '"' +
+          (f.kind === 'number' ? ' type="number" step="any"' : '') + ' value="' + esc(v) + '">';
+      }
+      // when the rich-body warning shows, suppress the "plain text…" hint (it implies editability)
+      var hintHtml = (f.hint && !extra) ? ' <i class="hint">' + esc(f.hint) + '</i>' : '';
+      return '<label class="field' + (f.wide ? ' wide' : '') + '"><span>' + esc(f.label) +
+        hintHtml + extra + '</span>' + inner + '</label>';
+    }).join('');
+    return '<details class="adm-item" data-idx="' + i + '"' + (open ? ' open' : '') + '>' +
+      '<summary><b>' + esc(admSummaryName(cfg, it)) + '</b><span class="adm-ord">' +
+      '<button type="button" class="ordbtn" data-mv="up" aria-label="Move up">&#8593;</button>' +
+      '<button type="button" class="ordbtn" data-mv="down" aria-label="Move down">&#8595;</button>' +
+      '</span></summary>' +
+      '<div class="adm-form">' + rows +
+      '<div class="adm-actions"><button type="button" class="btn sm" data-save="item">' +
+      icon('check') + 'Save</button>' +
+      '<button type="button" class="btn ghost sm danger" data-del="item">Delete</button></div>' +
+      '</div></details>';
+  }
+  function admRepaintItems(cfg, openIdx) {
+    var box = document.getElementById('admitems');
+    if (!box) return;
+    var items = adm.doc[cfg.list] || [];
+    box.innerHTML = items.map(function (it, i) {
+      return admItemForm(cfg, it, i, i === openIdx);
+    }).join('');
+    var count = document.getElementById('admcount');
+    if (count) count.textContent = items.length + ' ' + cfg.label + (items.length === 1 ? '' : 's');
+  }
+  function admReadItem(cfg, itemEl, idx) {
+    var it = adm.doc[cfg.list][idx] || {};
+    cfg.fields.forEach(function (f) {
+      var el = itemEl.querySelector('[data-f="' + f.k + '"]');
+      if (!el) return;
+      var v = el.value;
+      if (f.kind === 'number') {
+        it[f.k] = Number(v) || 0;
+      } else if (f.kind === 'body') {
+        it.body = v.split(/\n\s*\n/).map(function (p) {
+          return p.replace(/^\s+|\s+$/g, '');
+        }).filter(Boolean).map(function (p) { return { p: p }; });
+      } else {
+        it[f.k] = v;
+      }
+    });
+    adm.doc[cfg.list][idx] = it;
+  }
+  function admPaintManifest() {
+    var cfg = ADM_TABS[adm.tab];
+    var box = document.getElementById('admtab');
+    admFresh(cfg.file).then(function (doc) {
+      adm.doc = doc;
+      var items = doc[cfg.list] || [];
+      box.innerHTML =
+        '<div class="adm-head"><p class="muted">Editing <kbd>' + esc(cfg.file) + '</kbd> &mdash; ' +
+        '<span id="admcount">' + items.length + ' ' + esc(cfg.label) +
+        (items.length === 1 ? '' : 's') + '</span>. Saves go live immediately.</p>' +
+        '<button type="button" class="btn sm" id="admadd">Add a ' + esc(cfg.label) + '</button></div>' +
+        (cfg.site && cfg.site.length ? admSiteForm(cfg, doc) : '') +
+        '<div id="admitems">' + items.map(function (it, i) {
+          return admItemForm(cfg, it, i, false);
+        }).join('') + '</div>';
+      admWireManifest(cfg);
+    }).catch(function (e) {
+      box.innerHTML = '<p class="muted">Could not load ' + esc(cfg.file) + ' (' + esc(e.message) + ').</p>';
+    });
+  }
+  function admWireManifest(cfg) {
+    var box = document.getElementById('admtab');
+    document.getElementById('admadd').addEventListener('click', function () {
+      var blank = {};
+      cfg.fields.forEach(function (f) {
+        blank[f.k] = (f.kind === 'number') ? 0 : (f.kind === 'body') ? [] : '';
+      });
+      adm.doc[cfg.list] = adm.doc[cfg.list] || [];
+      adm.doc[cfg.list].unshift(blank);
+      admRepaintItems(cfg, 0);
+      admStatus('New ' + cfg.label + ' added - fill it in, then Save.', '');
+    });
+    box.addEventListener('click', function (ev) {
+      var t = ev.target.closest ? ev.target.closest('button') : null;
+      if (!t || !box.contains(t)) return;
+      var itemEl = t.closest('.adm-item');
+      var idx = itemEl && itemEl.hasAttribute('data-idx') ?
+        parseInt(itemEl.getAttribute('data-idx'), 10) : -1;
+      if (t.hasAttribute('data-mv')) {
+        ev.preventDefault();                        // keep the <details> from toggling
+        var d = (t.getAttribute('data-mv') === 'up') ? -1 : 1;
+        var arr = adm.doc[cfg.list];
+        if (idx < 0 || idx + d < 0 || idx + d >= arr.length) return;
+        var sw = arr[idx]; arr[idx] = arr[idx + d]; arr[idx + d] = sw;
+        admSaveJson(cfg.file, adm.doc).then(function () {
+          admRepaintItems(cfg, idx + d);
+          admStatus('Order saved.', 'ok');
+        }).catch(admErr);
+        return;
+      }
+      if (t.getAttribute('data-save') === 'site') {
+        var det = t.closest('.adm-item');
+        Array.prototype.forEach.call(det.querySelectorAll('[data-sf]'), function (inp) {
+          adm.doc[inp.getAttribute('data-sf')] = inp.value;
+        });
+        admSaveJson(cfg.file, adm.doc).then(function () {
+          var note = det.querySelector('.sum-note');
+          if (note) note.textContent = adm.doc[cfg.site[0][0]] || '';
+          admStatus('Site header saved.', 'ok');
+        }).catch(admErr);
+        return;
+      }
+      if (t.getAttribute('data-save') === 'item' && idx >= 0) {
+        admReadItem(cfg, itemEl, idx);
+        // a required key (product id / blog slug) is used to key the cart and the ?post= deep
+        // link, so it must be present and unique or the public site misbehaves. Block the save.
+        if (cfg.req) {
+          var key = String(adm.doc[cfg.list][idx][cfg.req] || '').replace(/^\s+|\s+$/g, '');
+          if (!key) {
+            admStatus('Give this ' + cfg.label + ' a ' + cfg.req + ' before saving (it keys the cart / deep link).', 'err');
+            return;
+          }
+          var dup = adm.doc[cfg.list].some(function (other, j) {
+            return j !== idx && String(other[cfg.req] || '') === key;
+          });
+          if (dup) {
+            admStatus('Another ' + cfg.label + ' already uses the ' + cfg.req + ' "' + key + '". Make it unique.', 'err');
+            return;
+          }
+        }
+        admSaveJson(cfg.file, adm.doc).then(function () {
+          var b = itemEl.querySelector('summary b');
+          if (b) b.textContent = admSummaryName(cfg, adm.doc[cfg.list][idx]);
+          admStatus('Saved.', 'ok');
+        }).catch(admErr);
+        return;
+      }
+      if (t.getAttribute('data-del') === 'item' && idx >= 0) {
+        if (t.getAttribute('data-arm') !== '1') {
+          t.setAttribute('data-arm', '1');
+          t.textContent = 'Really delete?';
+          admStatus('Press Delete again to remove this ' + cfg.label + '.', '');
+          setTimeout(function () {
+            t.removeAttribute('data-arm');
+            t.textContent = 'Delete';
+          }, 4000);
+          return;
+        }
+        adm.doc[cfg.list].splice(idx, 1);
+        admSaveJson(cfg.file, adm.doc).then(function () {
+          admRepaintItems(cfg, -1);
+          admStatus('Deleted. (Any file it pointed at is still in the folder - see Files.)', 'ok');
+        }).catch(admErr);
+        return;
+      }
+      if (t.hasAttribute('data-upl')) {
+        ev.preventDefault();
+        var k = t.getAttribute('data-upl');
+        var fi = itemEl.querySelector('[data-uplfile="' + k + '"]');
+        if (fi) fi.click();
+      }
+    });
+    box.addEventListener('change', function (ev) {
+      var fi = ev.target;
+      if (!fi || !fi.hasAttribute || !fi.hasAttribute('data-uplfile')) return;
+      var f = fi.files && fi.files[0];
+      if (!f) return;
+      var k = fi.getAttribute('data-uplfile');
+      var itemEl = fi.closest('.adm-item');
+      var bar = itemEl.querySelector('[data-uplbar="' + k + '"]');
+      var input = itemEl.querySelector('[data-f="' + k + '"]');
+      var rel = 'assets/uploads/' + admSafeName(f.name);
+      admStatus('Uploading ' + f.name + '…');
+      admUpload(f, rel, bar).then(function (path) {
+        if (bar) bar.hidden = true;
+        if (input) input.value = path;
+        admStatus('Uploaded ' + path + ' - now Save the ' + cfg.label + '.', 'ok');
+      }).catch(function (e) {
+        if (bar) bar.hidden = true;
+        admErr(e);
+      });
+      fi.value = '';                               // allow re-picking the same file
+    });
+  }
+
+  // ---- the Files tab: browse / upload anywhere / delete ----------------------
+  function admPaintFiles() {
+    var box = document.getElementById('admtab');
+    admApi('GET', 'api/list').then(function (r) {
+      if (r.status === 401 || r.status === 404) {
+        admSetToken(''); admLogin('Session expired - sign in again.');
+        throw new Error('signed out');
+      }
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      return r.text();
+    }).then(function (txt) {
+      var files = txt.split('\n').filter(Boolean).sort();
+      var CORE = { 'index.html': 1, 'app.js': 1, 'app.css': 1, 'store.json': 1,
+        'blog.json': 1, 'data.json': 1, 'sw.js': 1, 'site.webmanifest': 1 };
+      box.innerHTML =
+        '<div class="adm-head"><p class="muted">' + files.length + ' files in the shared folder. ' +
+        'Big uploads travel in 192 KB slices through the editor&rsquo;s write + append pair.</p></div>' +
+        '<div class="adm-upl"><label class="field"><span>Upload into</span>' +
+        '<input class="input" id="admdest" value="assets/uploads"></label>' +
+        '<button type="button" class="btn sm" id="admpick">' + icon('upload') + 'Choose a file&hellip;</button>' +
+        '<input type="file" class="vh" id="admfile" tabindex="-1" aria-label="Choose a file to upload">' +
+        '<progress class="upl-bar" id="admbar" hidden></progress></div>' +
+        '<ul class="adm-files">' + files.map(function (p) {
+          return '<li><a class="fpath" href="' + esc(href(p)) + '" target="_blank" rel="noopener">' +
+            esc(p) + '</a>' +
+            (CORE[p] ? '<span class="corechip">site file</span>' : '') +
+            '<button type="button" class="btn ghost sm danger" data-delf="' + esc(p) + '">Delete</button></li>';
+        }).join('') + '</ul>';
+      document.getElementById('admpick').addEventListener('click', function () {
+        document.getElementById('admfile').click();
+      });
+      document.getElementById('admfile').addEventListener('change', function () {
+        var f = this.files && this.files[0];
+        if (!f) return;
+        var dest = document.getElementById('admdest').value.replace(/^\/+|\/+$/g, '');
+        if (/\.\.|:/.test(dest)) { admStatus('That folder path looks unsafe.', 'err'); return; }
+        var rel = (dest ? dest + '/' : '') + admSafeName(f.name);
+        var bar = document.getElementById('admbar');
+        admStatus('Uploading ' + f.name + '…');
+        admUpload(f, rel, bar).then(function (path) {
+          admStatus('Uploaded ' + path + '.', 'ok');
+          admPaintFiles();
+        }).catch(function (e) {
+          if (bar) bar.hidden = true;
+          admErr(e);
+        });
+        this.value = '';
+      });
+      // Delegate on the FRESH <ul> (rebuilt on every paint), never on the persistent #admtab -
+      // admPaintFiles re-runs after each upload/delete, so binding to #admtab would stack the
+      // handler and defeat the two-step delete confirm.
+      box.querySelector('.adm-files').addEventListener('click', function (ev) {
+        var t = ev.target.closest ? ev.target.closest('[data-delf]') : null;
+        if (!t) return;
+        if (t.getAttribute('data-arm') !== '1') {
+          t.setAttribute('data-arm', '1');
+          t.textContent = 'Really delete?';
+          admStatus('Press Delete again to remove ' + t.getAttribute('data-delf') + '.', '');
+          setTimeout(function () {
+            t.removeAttribute('data-arm');
+            t.textContent = 'Delete';
+          }, 4000);
+          return;
+        }
+        var p = t.getAttribute('data-delf');
+        admApi('POST', 'api/delete?path=' + encodeURIComponent(p)).then(function (r) {
+          if (!r.ok) throw new Error('HTTP ' + r.status);
+          admStatus('Deleted ' + p + '.', 'ok');
+          admPaintFiles();
+        }).catch(admErr);
+      });
+    }).catch(function (e) {
+      if (e && e.message === 'signed out') return;
+      box.innerHTML = '<p class="muted">Could not list files (' + esc(e.message) + ').</p>';
+    });
+  }
+
   var VIEWS = {
     '':         { html: vHome,     after: null },
     'gallery':  { html: vGallery,  after: fillGallery },
@@ -851,7 +1395,8 @@
     'checkout': { html: vCheckout, after: wireCheckout },
     'blog':     { html: vBlog,     after: wireBlog },
     'backend':  { html: vBackend,  after: wireBackend },
-    'about':    { html: vAbout,    after: wireAbout }
+    'about':    { html: vAbout,    after: wireAbout },
+    'admin':    { html: vAdmin,    after: wireAdmin }
   };
 
   // --- render + routing -------------------------------------------------------

@@ -354,6 +354,23 @@ def edit_safe_path(root, rel):
     return root + "/" + "/".join(out)
 
 
+# ---- qsEditParentDirs: the folder chain an editor write must create first -------
+# "a/b/c.png" -> ["a", "a/b"]; a root-level file -> []. Trailing "/" stripped so a
+# folder-ish input can't make its own leaf a folder. Only ever called on a path that
+# edit_safe_path already accepted. Mirrors qsEditParentDirs.
+
+def edit_parent_dirs(rel):
+    r = rel.replace("\\", "/")
+    clean = [seg for seg in r.split("/") if seg != "" and seg != "."]
+    out, cur = [], ""
+    for i, seg in enumerate(clean):
+        if i == len(clean) - 1:
+            break                                 # the last real segment is the file itself
+        cur = seg if not cur else cur + "/" + seg
+        out.append(cur)
+    return out
+
+
 # ---- qsEditIsLocal: the LAN-first gate (the editor's OTHER linchpin) ---------
 # The web editor may only be reached from the local network. The ONLY trustworthy
 # signal is the accepted-socket peer address the engine gives us (a remote client
@@ -854,6 +871,24 @@ def main():
     ]:
         check("edit_safe_path(%r)" % rel, edit_safe_path(R, rel), want)
 
+    # -- parent-folder chain for editor writes/uploads into new subfolders --
+    for rel, want in [
+        ("c.png", []),                            # root-level file: nothing to create
+        ("a/c.png", ["a"]),
+        ("a/b/c.png", ["a", "a/b"]),
+        ("assets/uploads/pic.jpg", ["assets", "assets/uploads"]),
+        ("a//b/c.png", ["a", "a/b"]),             # doubled slash collapses
+        ("a/./b/c.png", ["a", "a/b"]),            # "." segments vanish
+        ("a\\b\\c.png", ["a", "a/b"]),            # backslashes normalise
+        ("a/b/", ["a"]),                          # trailing "/": leaf is still the leaf
+        ("a/b/.", ["a"]),                         # trailing "." must NOT make the leaf a folder
+        ("a/b/./", ["a"]),                        # ...nor a trailing "/./"
+        (".", []),                                # a lone "." -> no parents
+        ("/", []),
+        ("", []),
+    ]:
+        check("edit_parent_dirs(%r)" % rel, edit_parent_dirs(rel), want)
+
     # -- directory-listing icon classification --
     for name, is_dir, want in [
         ("photos", True, "dir"),                  # a folder
@@ -1119,7 +1154,7 @@ def main():
           "length, JSON escape, editor confinement, LAN-first gate, query parse, size "
           "probe, filename sanitise, rate + ETA format, HTTP-date, Allow header, "
           "editor login backoff, user-route path + header sanitise, template render + "
-          "escape, CORS preflight, conditional-GET ETag all match)")
+          "escape, CORS preflight, conditional-GET ETag, editor parent-dirs all match)")
     return 0
 
 

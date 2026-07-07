@@ -56,9 +56,33 @@ compiled or copied:
      service-worker check registers and lights up.
    - **Over a direct web link** - pick the **Web link** method; the app is served under
      `http://<ip>:<port>/<token>/` and opens in any browser.
-4. *(Optional)* enable the LAN-only **web editing** option, set a password, and open the
-   link with **`/_edit`** appended to edit these files from a browser on your LAN. The
-   service worker deliberately does no caching, so edits show up immediately.
+4. *(Optional)* enable the LAN-only **web editing** option and set a password. Then either
+   append **`/_edit`** to the link for the raw file editor, or click **Admin** in the
+   demo's own footer for the friendly **site-admin panel** (see below). The service worker
+   deliberately does no caching, so edits show up immediately.
+
+### The admin panel (the live editor, with a face)
+
+The footer's **Admin** link opens `#admin`, a real content manager built entirely on the
+host's LAN-only editor API - no second server, no cloud:
+
+- It **probes reachability** first (an empty `POST /_edit/login`, which the host answers
+  `400`/`429` when the editor is live and `404` otherwise). Over Tor, the public web, or a
+  static preview it degrades to an honest explainer - the editor simply is not there.
+- After a password login (throttled server-side; the session token lives in
+  `sessionStorage`), tabs edit **Store**, **Gallery** and **Blog** as forms over
+  `store.json` / `data.json` / `blog.json`, plus a **Files** tab to browse, upload and
+  delete. Every write is a `PUT /_edit/api/write` of pretty-printed JSON; saves go live at
+  once (the page drops its manifest cache so the public views refetch).
+- **Media uploads stream in slices:** the first 192 KB goes to `PUT /_edit/api/write`
+  (create/truncate) and each further slice to `PUT /_edit/api/append`, so a file larger
+  than the host's 256 KB request cap arrives in bounded pieces - the download path's
+  fixed-slice discipline, in reverse. A single upload is capped at **1 GiB total**
+  (`kEditMaxUploadBytes`); uploads land in `assets/uploads/`, and missing parent folders are
+  created by the host (`qsEditEnsureFolders`). Hidden (dot-leading) paths cannot be created
+  through the editor, so an upload can never plant an invisible file.
+- The whole panel is **fail-closed and same-origin**: it can do nothing the raw editor
+  could not, and the editor is LAN-only, password-gated and off by default.
 
 ### The routes the host provides for it
 
@@ -76,6 +100,11 @@ compiled or copied:
   files without the sharer's machine ever holding a whole file in memory.
 - **Forced download (`?dl`).** `qsHttpDisposition` serves `inline` by default and
   `attachment` when the query carries `dl` - the Store's entire delivery mechanism.
+- **Editor API (LAN-only, auth-gated).** `POST /_edit/login`, `GET /_edit/api/list`,
+  `GET /_edit/api/read`, `PUT /_edit/api/write`, `PUT /_edit/api/append` and
+  `POST /_edit/api/delete`. Every one gates on `qsEditAuthed` (enabled + LAN-local +
+  served-folder + session token) and confines paths with `qsEditSafePath`; over Tor or
+  the public web they answer `404`. The Admin panel is a pure client of these.
 
 ## The two design constraints
 

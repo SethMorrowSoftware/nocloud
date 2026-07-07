@@ -99,11 +99,29 @@ Inspect the raw headers on any file response (curl `-I`, or the webapp Backend i
 - [ ] An honest user who waits out the window -> not stuck (a quiet streak is forgiven).
 - [ ] Editor writes cannot escape the shared folder (path confinement).
 
+## 6a. Admin panel + upload/append/delete (editor ON, over a LAN web link)
+
+- [ ] Footer **Admin** link over Tor / a static preview -> the honest "no editor here" card
+      (the host answers `404` to the probe); over a LAN web link with the editor on -> the login.
+- [ ] Sign in -> the dashboard; **Store/Gallery/Blog** tabs edit an item and **Save** -> the
+      change is on disk (`store.json` etc. re-pretty-printed) and the matching public page shows it.
+- [ ] **Add**, **Delete** (two-step), and **move up/down** all persist and re-order correctly.
+- [ ] **Files** tab lists the folder; **upload a >256 KB file** -> it arrives whole via the
+      `write` + `append` slice pair, lands in `assets/uploads/`, and the parent folder is created
+      if absent; **Delete** removes one file (a folder is refused).
+- [ ] A cover/media **Upload…** on a store item fills the path field; Save wires it to the product.
+- [ ] Error edges: append to a path that is a **folder** -> `409`; an upload over **1 GiB** ->
+      `413 "That upload is too large."`; a **hidden (dot) path** write -> `400`; a mid-session token
+      expiry (`401`/`404`) -> the panel forces a **re-login** rather than erroring silently.
+- [ ] Saving a product with an **empty/duplicate id** (or a post with an empty/duplicate slug) is
+      **refused** in the UI; editing a blog post that has headings/lists/code keeps them intact.
+
 ## 7. Webapp demo (open the served `webapp/` folder in a browser)
 
 - [ ] **Backend tab** -> live `/_qs/info`; the header inspector shows all **eight** headers
       (including the four privacy ones); `OPTIONS -> Allow`; the templated `/api/echo?msg=…` call.
 - [ ] **About tab** -> "honest privacy model" populated from `/_qs/transparency`.
+- [ ] **Admin link** in the footer routes to the admin panel (see §6a).
 
 ## 8. Fail-closed extensions & clean shutdown
 
