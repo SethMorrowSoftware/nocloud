@@ -71,7 +71,8 @@
     link:    '<path d="M9.5 14.5l5-5"/><path d="M10.5 6.5l1-1a3.5 3.5 0 0 1 5 5l-1 1"/><path d="M13.5 17.5l-1 1a3.5 3.5 0 0 1-5-5l1-1"/>',
     bolt:    '<path d="M13 3L5 13.5h5.5L11 21l8-10.5h-5.5z" fill="currentColor" stroke="none"/>',
     shield:  '<path d="M12 3.5l7 3v5c0 5-3 7.5-7 9.5-4-2-7-4.5-7-9.5v-5z"/><path d="M9 12l2 2 4-4.5"/>',
-    folder:  '<path d="M4 7.5h5l2 2h9v9.5H4z"/>'
+    folder:  '<path d="M4 7.5h5l2 2h9v9.5H4z"/>',
+    cart:    '<path d="M3 4h2l2 11h10l2-8H6"/><circle cx="9" cy="19" r="1.3"/><circle cx="17" cy="19" r="1.3"/>'
   };
   function icon(name, cls) {
     return '<svg class="ic' + (cls ? ' ' + cls : '') + '" viewBox="0 0 24 24" aria-hidden="true">' +
@@ -185,8 +186,11 @@
       '<circle class="pkt pkt-r" cx="180" cy="110" r="4" fill="#ec4899"/>' +
       '<circle class="pkt pkt-t" cx="180" cy="110" r="4" fill="#3b82f6"/>' +
       '<g class="qs-peer core">' +
-        '<rect x="150" y="84" width="60" height="50" rx="14" fill="url(#qsc)"/>' +
-        '<path d="M162 106h14l4-5h13" stroke="#fff" stroke-width="2" fill="none" opacity=".85"/>' +
+        '<rect x="168" y="92" width="18" height="22" rx="2.5" fill="#eef2ff" transform="rotate(-7 177 103)"/>' +  // files inside,
+        '<rect x="180" y="92" width="18" height="22" rx="2.5" fill="#c7d2fe" transform="rotate(6 189 103)"/>' +   // peeking out the top
+        '<path d="M150 130V98a4 4 0 0 1 4-4h17l6 7h29a4 4 0 0 1 4 4v25a4 4 0 0 1-4 4h-52a4 4 0 0 1-4-4Z" fill="url(#qsc)"/>' + // folder + tab
+        '<path d="M150 114v12a4 4 0 0 0 4 4h52a4 4 0 0 0 4-4v-12Z" fill="#fff" opacity=".09"/>' + // front pocket, lightened
+        '<path d="M150 114h60" stroke="#fff" stroke-width="1.4" opacity=".3"/>' + // pocket seam
       '</g>' +
       '<g class="qs-peer b"><circle cx="95" cy="225" r="17" fill="#0f1428" stroke="url(#qsg)" stroke-width="2.5"/><circle cx="95" cy="225" r="4.5" fill="#22d3ee"/></g>' +
       '<g class="qs-peer c"><circle cx="265" cy="225" r="17" fill="#0f1428" stroke="url(#qsg)" stroke-width="2.5"/><circle cx="265" cy="225" r="4.5" fill="#ec4899"/></g>' +
@@ -464,7 +468,11 @@
     var bar = document.getElementById('cartbar');
     if (!bar) return;
     var cart = cartLoad();
-    if (!cart.length) { bar.innerHTML = '<span class="muted">Your cart is empty.</span>'; return; }
+    if (!cart.length) {
+      bar.innerHTML = '<span class="cart-empty">' + icon('cart') +
+        'Your cart is empty &mdash; add an item and watch the host deliver it as a real download.</span>';
+      return;
+    }
     bar.innerHTML = '<span class="cart-count">' + icon('store') + ' <b>' + cart.length + '</b> item' +
       (cart.length === 1 ? '' : 's') + ' in the cart</span>' +
       '<a class="btn grow" data-route="checkout" href="' + esc(href('checkout')) + '">Check out &mdash; $0.00</a>' +
@@ -482,13 +490,14 @@
     var cart = cartLoad();
     box.innerHTML = products.map(function (p) {
       var inCart = cart.indexOf(p.id) !== -1;
+      var priced = Number(p.price) > 0;
       return '<div class="tile prod">' +
         '<img loading="lazy" src="' + esc(p.image) + '" alt="' + esc(p.title) + '">' +
         '<div class="cap"><b>' + esc(p.title) + '</b><span>' + esc(p.blurb) + '</span>' +
         '<span class="prodmeta"><span class="chip">' + esc(p.kind) + ' &middot; ' + esc(p.size) + '</span>' +
-        '<span class="price">$' + Number(p.price).toFixed(2) + '</span></span>' +
+        '<span class="price' + (priced ? '' : ' free') + '">' + (priced ? '$' + Number(p.price).toFixed(2) : 'Free') + '</span></span>' +
         '<button class="btn' + (inCart ? ' ghost' : '') + '" data-add="' + esc(p.id) + '">' +
-        (inCart ? icon('check') + 'In the cart' : 'Add to cart') + '</button></div></div>';
+        (inCart ? icon('check') + 'In the cart' : icon('cart') + 'Add to cart') + '</button></div></div>';
     }).join('');
     Array.prototype.forEach.call(box.querySelectorAll('[data-add]'), function (b) {
       b.addEventListener('click', function () {

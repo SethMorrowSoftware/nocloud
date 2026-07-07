@@ -480,8 +480,14 @@ audio { width: 100%; border-radius: 999px; }
 }
 .cartbar .grow { margin-left: auto; }
 .cartbar b { color: var(--ink); }
+.cart-empty { display: inline-flex; align-items: center; gap: .5em; color: var(--muted); }
+.cart-empty .ic { width: 1.15em; height: 1.15em; color: var(--accent); opacity: .85; flex: none; }
 .shopgrid { grid-template-columns: repeat(auto-fill, minmax(14em, 1fr)); }
 .prod { background: var(--panel); display: flex; flex-direction: column; }
+/* the thumbnails are 4:3 product covers - show them whole (a banner crop clipped their art) */
+.prod img { height: auto; aspect-ratio: 4 / 3; }
+.prod:hover { transform: translateY(-4px); box-shadow: inset 0 0 0 1px var(--hair-strong), 0 22px 46px rgba(30, 40, 80, .22); }
+.prod:hover img { transform: scale(1.05); }
 .prod .cap { flex: 1 1 auto; display: flex; flex-direction: column; gap: .5em; padding: .75em .8em .85em; }
 .prod .cap > span:first-of-type { font-size: .82em; color: var(--muted); line-height: 1.5; }
 .prodmeta { display: flex; align-items: center; justify-content: space-between; gap: .5em; margin-top: auto; }
@@ -492,7 +498,14 @@ audio { width: 100%; border-radius: 999px; }
 }
 .prodmeta .price { font-weight: 720; color: var(--ink);
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: .95em; }
-.prod .btn { justify-content: center; width: 100%; }
+/* every demo good is free: a small green pill reads as intentional, not a sad "$0.00" */
+.prodmeta .price.free {
+  font-family: inherit; font-size: .72em; font-weight: 680; letter-spacing: .03em; text-transform: uppercase;
+  color: var(--green); background: rgba(16, 185, 129, .12);
+  border: 1px solid rgba(16, 185, 129, .42); padding: .22em .62em; border-radius: 999px;
+}
+.prod .btn { justify-content: center; width: 100%; gap: .45em; }
+.prod .btn .ic { width: 1.05em; height: 1.05em; }
 .prod .btn.ghost { color: var(--green); box-shadow: inset 0 0 0 1px rgba(16, 185, 129, .45); }
 ul.order { list-style: none; margin: .9em 0; padding: 0; display: grid; gap: .55em; }
 ul.order li {
