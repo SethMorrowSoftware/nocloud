@@ -18,7 +18,11 @@
 > active custom routes (method/path/kind only); the `Allow` header on `OPTIONS`/`405` now also
 > reflects user-declared route methods; the editor-login `429` carries a `Retry-After`; and a
 > `cors: true` route now also answers the `OPTIONS` **CORS preflight** (so preflighted
-> cross-origin requests, not just simple GETs, work).
+> cross-origin requests, not just simple GETs, work). And **conditional GET** landed: every file
+> response carries a weak `ETag` (`W/"size-seed-gen"` — a per-launch seed + an edit-generation
+> counter stand in for the per-file mtime the engine has no cheap way to read), and a matching
+> `If-None-Match` on a full request returns `304 Not Modified` with no body. Still open: a shared
+> clearweb/Tor serve core, and first-class per-route streaming/params.
 > Still open: conditional GET (`ETag`/`304`) — held back because a correct ETag wants a cheap
 > per-file mtime the engine only exposes via a directory scan (against the one-stat-per-request
 > rule) — plus a shared clearweb/Tor serve core and first-class per-route streaming/params.

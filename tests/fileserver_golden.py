@@ -524,6 +524,37 @@ def cors_preflight(cors_keys, path, allow):
     return ""
 
 
+# ---- conditional GET: the weak ETag + If-None-Match match ---------------------
+# A file response carries W/"<size>-<seed>-<gen>" (no cheap per-file mtime on the engine, so the
+# ETag changes on every signal the server CAN see: size, per-launch seed, edit generation). A
+# non-Range request whose If-None-Match matches -> 304. Mirrors qsHttpWeakETag / qsETagCore /
+# qsIfNoneMatch.
+
+def http_weak_etag(size, seed, gen):
+    return 'W/"%s-%s-%s"' % (size, seed, gen)
+
+
+def etag_core(tag):
+    out = tag.strip()
+    if out[:2] == "W/":
+        out = out[2:]
+    out = out.strip()
+    if out[:1] == '"':
+        out = out[1:]
+    if out[-1:] == '"':
+        out = out[:-1]
+    return out
+
+
+def if_none_match(header, etag):
+    if header == "":
+        return False
+    if header.strip() == "*":
+        return True
+    want = etag_core(etag)
+    return any(etag_core(tok) == want for tok in header.split(","))
+
+
 # ---- qsEditLoginWait: editor login brute-force backoff -----------------------
 # ms this peer must still wait before another attempt. First _EDIT_FREE_TRIES fails are
 # free; after that the required gap doubles each fail, capped. Constants mirror the kEdit*
@@ -965,6 +996,27 @@ def main():
     check("cors_preflight no-cors-route", cors_preflight(_cors_keys, "/api/other", "GET, HEAD, OPTIONS"), "")
     check("cors_preflight empty", cors_preflight([], "/api/submit", "GET, HEAD, OPTIONS"), "")
 
+    # -- conditional GET: weak ETag build, core extraction, If-None-Match match --
+    check("http_weak_etag", http_weak_etag(1000, 42, 0), 'W/"1000-42-0"')
+    _et = http_weak_etag(1000, 42, 3)                       # W/"1000-42-3"
+    for tag, want in [
+        ('W/"1000-42-3"', "1000-42-3"),                    # weak form
+        ('"1000-42-3"', "1000-42-3"),                      # strong form
+        (' W/"abc" ', "abc"),                              # surrounding whitespace
+        ('W/""', ""),                                      # empty value
+    ]:
+        check("etag_core(%r)" % tag, etag_core(tag), want)
+    for header, want in [
+        ("", False),                                       # no header -> not conditional
+        ("*", True),                                       # wildcard matches anything
+        ('W/"1000-42-3"', True),                           # exact weak match
+        ('"1000-42-3"', True),                             # strong sent, weak compare -> match
+        ('W/"1000-42-2"', False),                          # a stale gen -> no match (re-send)
+        ('W/"9-9-9", W/"1000-42-3"', True),                # match anywhere in the list
+        ('W/"9-9-9"', False),                              # different resource -> no match
+    ]:
+        check("if_none_match(%r)" % header, if_none_match(header, _et), want)
+
     # -- editor login brute-force backoff --
     for fails, last_ms, now_ms, want in [
         (0, None, 1000, 0),                     # first attempt: free
@@ -1067,7 +1119,7 @@ def main():
           "length, JSON escape, editor confinement, LAN-first gate, query parse, size "
           "probe, filename sanitise, rate + ETA format, HTTP-date, Allow header, "
           "editor login backoff, user-route path + header sanitise, template render + "
-          "escape, CORS preflight all match)")
+          "escape, CORS preflight, conditional-GET ETag all match)")
     return 0
 
 

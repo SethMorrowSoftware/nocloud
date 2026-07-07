@@ -155,6 +155,10 @@ local sEditVerify       -- sxSecretBox verifier: proves a login password is corr
 local sEditSession      -- the current valid edit-session token (random hex), or empty
 local sEditFails        -- array: peer ip -> consecutive failed edit-login count (brute-force throttle)
 local sEditLastMs       -- array: peer ip -> the milliseconds of that peer's last login attempt
+local sEditGen          -- monotonic edit generation: bumped on every editor write, folded into
+                        -- the weak ETag so a live edit invalidates the browser's cached copy
+local sHttpEtagSeed     -- per-session nonce in the weak ETag: it changes every launch, so a
+                        -- restart never lets a stale same-size cached copy revalidate (304) wrongly
 -- Clearweb (direct, non-Tor) web sharing. A plain LiveCode socket HTTP server serves
 -- a file/folder to any browser at http://<ip>:<port>/<token>/... . No Cloud Quick Share's
 -- libtorrent opens the router port automatically (btMapPort / UPnP-NAT-PMP) and
@@ -1066,6 +1070,8 @@ command qsStart
    put empty into sEditSalt
    put empty into sEditVerify
    put empty into sEditSession
+   put 0 into sEditGen
+   put the milliseconds into sHttpEtagSeed  -- fresh each launch: a restart never 304s a stale copy
    qsHttpRoute "GET", "/_edit", "qsEditPageRoute"
    qsHttpRoute "POST", "/_edit/login", "qsEditLoginRoute"
    qsHttpRoute "GET", "/_edit/api/list", "qsEditListRoute"
@@ -4743,6 +4749,7 @@ command qsEditWriteRoute pConn, pRequest
       qsHttpReply pConn, 500, "text/plain; charset=utf-8", ("Write failed: " & tErr)
       exit qsEditWriteRoute
    end if
+   add 1 to sEditGen             -- a live edit invalidates every weak ETag -> caches revalidate
    qsHttpReply pConn, 200, "text/plain; charset=utf-8", "Saved."
 end qsEditWriteRoute
 
@@ -5014,6 +5021,59 @@ function qsHttpDisposition pForMime, pHeaders
    return ("Content-Disposition: " & tKind & "; filename=" & quote & tName & quote & tCrlf)
 end qsHttpDisposition
 
+-- The WEAK validator (ETag) for a file response: W/"<size>-<seed>-<gen>". We cannot cheaply
+-- read a per-file modification time on this engine, so the ETag changes on every signal the
+-- server CAN see: the byte size, the per-launch seed (a restart never revalidates a stale
+-- same-size copy), and the edit generation (any editor write bumps it). Weak because it is not a
+-- byte-hash; that is correct for conditional GET, where the match is always same-URL. Pure;
+-- golden: http_weak_etag().
+function qsHttpWeakETag pSize, pSeed, pGen
+   return "W/" & quote & pSize & "-" & pSeed & "-" & pGen & quote
+end qsHttpWeakETag
+
+-- The comparable core of one ETag token: drop an optional weak "W/" prefix and the surrounding
+-- quotes, so two etags compare by value (RFC weak comparison). Pure; golden: etag_core().
+function qsETagCore pTag
+   local tOut
+   put qsTrim(pTag) into tOut
+   if char 1 to 2 of tOut is "W/" then
+      delete char 1 to 2 of tOut
+   end if
+   put qsTrim(tOut) into tOut
+   if char 1 of tOut is quote then
+      delete char 1 of tOut
+   end if
+   if char -1 of tOut is quote then
+      delete char -1 of tOut
+   end if
+   return tOut
+end qsETagCore
+
+-- Does an If-None-Match request header match our current ETag? "*" matches anything; otherwise
+-- the header is a comma-list of etags and we weak-compare each (etags never contain a comma, so
+-- a plain split is safe). Pure; golden: if_none_match().
+function qsIfNoneMatch pHeader, pETag
+   local tTok, tWant, tSavedID, tHit
+   if pHeader is empty then
+      return false
+   end if
+   if qsTrim(pHeader) is "*" then
+      return true
+   end if
+   put qsETagCore(pETag) into tWant
+   put false into tHit
+   put the itemDelimiter into tSavedID
+   set the itemDelimiter to comma
+   repeat for each item tTok in pHeader
+      if qsETagCore(tTok) is tWant then
+         put true into tHit
+         exit repeat
+      end if
+   end repeat
+   set the itemDelimiter to tSavedID
+   return tHit
+end qsIfNoneMatch
+
 -- The clearweb peer's IP, from the accepted-socket id "<ip>:<port>[|n]".
 function qsCwPeer pSocketID
    local tIp, tSavedID
@@ -5035,7 +5095,7 @@ end qsAccessLog
 -- pTypeOverride/pExtra (optional): a Content-Type override and extra CRLF-terminated header
 -- lines, used by user "file" routes. Existing 4-arg callers leave both empty (no change).
 command qsFsServeFile pStream, pDisk, pForMime, pHeaders, pTypeOverride, pExtra
-   local tSize, tRange, tStart, tEnd, tLen, tStatus, tHead, tCrlf, tType, tSavedID
+   local tSize, tRange, tStart, tEnd, tLen, tStatus, tHead, tCrlf, tType, tSavedID, tETag
    put qsFileSize(pDisk) into tSize
    if tSize is empty then
       qsFsSendText pStream, "404 Not Found", "text/plain; charset=utf-8", "Not found."
@@ -5045,6 +5105,20 @@ command qsFsServeFile pStream, pDisk, pForMime, pHeaders, pTypeOverride, pExtra
    put qsFsMime(pForMime) into tType
    if pTypeOverride is not empty then
       put pTypeOverride into tType
+   end if
+   -- Conditional GET: on a full (non-Range) request whose If-None-Match still matches our weak
+   -- ETag, the client's cached copy is current -> 304 with no body (Cache-Control: no-cache
+   -- already told it to revalidate). A Range request skips this and serves the bytes.
+   put qsHttpWeakETag(tSize, sHttpEtagSeed, sEditGen) into tETag
+   if pHeaders["range"] is empty and qsIfNoneMatch(pHeaders["if-none-match"], tETag) then
+      put ("HTTP/1.1 304 Not Modified" & tCrlf & "ETag: " & tETag & tCrlf) into tHead
+      put qsHttpExtraHeaders() after tHead
+      put pExtra after tHead
+      put ("Connection: close" & tCrlf & tCrlf) after tHead
+      oxWrite pStream, textEncode(tHead, "UTF-8")
+      oxCloseStream pStream
+      qsFsCleanup pStream
+      exit qsFsServeFile
    end if
    put qsFsParseRange(pHeaders["range"], tSize) into tRange
    if tRange is "unsatisfiable" then
@@ -5069,7 +5143,7 @@ command qsFsServeFile pStream, pDisk, pForMime, pHeaders, pTypeOverride, pExtra
    end if
    put (tEnd - tStart + 1) into tLen
    put ("HTTP/1.1 " & tStatus & tCrlf & "Content-Type: " & tType & tCrlf & \
-      "Accept-Ranges: bytes" & tCrlf & "Content-Length: " & tLen & tCrlf) into tHead
+      "Accept-Ranges: bytes" & tCrlf & "ETag: " & tETag & tCrlf & "Content-Length: " & tLen & tCrlf) into tHead
    if tStatus begins with "206" then
       put ("Content-Range: bytes " & tStart & "-" & tEnd & "/" & tSize & tCrlf) after tHead
    end if
@@ -5954,7 +6028,7 @@ end qsCwServe
 -- pTypeOverride/pExtra (optional): a Content-Type override and extra CRLF-terminated header
 -- lines, used by user "file" routes. Existing 4-arg callers leave both empty (no change).
 command qsCwServeFile pSocketID, pDisk, pForMime, pHeaders, pTypeOverride, pExtra
-   local tSize, tRange, tStart, tEnd, tLen, tStatus, tHead, tCrlf, tType, tSavedID
+   local tSize, tRange, tStart, tEnd, tLen, tStatus, tHead, tCrlf, tType, tSavedID, tETag
    put qsFileSize(pDisk) into tSize
    if tSize is empty then
       qsCwSendText pSocketID, "404 Not Found", "text/plain; charset=utf-8", "Not found."
@@ -5964,6 +6038,17 @@ command qsCwServeFile pSocketID, pDisk, pForMime, pHeaders, pTypeOverride, pExtr
    put qsFsMime(pForMime) into tType
    if pTypeOverride is not empty then
       put pTypeOverride into tType
+   end if
+   -- Conditional GET: a full (non-Range) request whose If-None-Match matches our weak ETag ->
+   -- 304, no body (see qsFsServeFile for the ETag rationale). A Range request serves the bytes.
+   put qsHttpWeakETag(tSize, sHttpEtagSeed, sEditGen) into tETag
+   if pHeaders["range"] is empty and qsIfNoneMatch(pHeaders["if-none-match"], tETag) then
+      put ("HTTP/1.1 304 Not Modified" & tCrlf & "ETag: " & tETag & tCrlf) into tHead
+      put qsHttpExtraHeaders() after tHead
+      put pExtra after tHead
+      put ("Connection: close" & tCrlf & tCrlf) after tHead
+      qsCwWriteClose pSocketID, textEncode(tHead, "UTF-8")
+      exit qsCwServeFile
    end if
    put qsFsParseRange(pHeaders["range"], tSize) into tRange
    if tRange is "unsatisfiable" then
@@ -5986,7 +6071,7 @@ command qsCwServeFile pSocketID, pDisk, pForMime, pHeaders, pTypeOverride, pExtr
    end if
    put (tEnd - tStart + 1) into tLen
    put ("HTTP/1.1 " & tStatus & tCrlf & "Content-Type: " & tType & tCrlf & \
-      "Accept-Ranges: bytes" & tCrlf & "Content-Length: " & tLen & tCrlf) into tHead
+      "Accept-Ranges: bytes" & tCrlf & "ETag: " & tETag & tCrlf & "Content-Length: " & tLen & tCrlf) into tHead
    if tStatus begins with "206" then
       put ("Content-Range: bytes " & tStart & "-" & tEnd & "/" & tSize & tCrlf) after tHead
    end if
