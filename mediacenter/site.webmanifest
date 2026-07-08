@@ -1,0 +1,13 @@
+{
+  "name": "No Cloud Media Center",
+  "short_name": "Media Center",
+  "description": "Your movies and TV, streamed across your own LAN from a folder shared by No Cloud Quick Share.",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "background_color": "#0a0d16",
+  "theme_color": "#0a0d16",
+  "icons": [
+    { "src": "assets/logo.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any" }
+  ]
+}
