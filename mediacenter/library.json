@@ -1,0 +1,15 @@
+{
+  "_about": "Optional settings for No Cloud Media Center. The app reads this file at startup; delete it (or any key) to fall back to the defaults shown here. Keys starting with an underscore are comments and are ignored.",
+
+  "_title": "Shown in the header and the browser tab. Make it yours: 'The Morrow Family Cinema'.",
+  "title": "",
+
+  "_tagline": "A short line under the library heading on the home screen.",
+  "tagline": "",
+
+  "_sections": "One entry per top-level media folder. 'path' is the folder name inside this shared folder; 'kind' is 'movies' (a poster wall of standalone films) or 'tv' (folder-per-show, then optional Season folders, then episodes). Add more sections freely - e.g. {\"id\": \"kids\", \"label\": \"Kids\", \"path\": \"Kids Movies\", \"kind\": \"movies\"}.",
+  "sections": [
+    { "id": "movies", "label": "Movies", "path": "Movies", "kind": "movies" },
+    { "id": "tv",     "label": "TV",     "path": "TV",     "kind": "tv" }
+  ]
+}

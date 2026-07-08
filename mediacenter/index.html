@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark light">
+  <meta name="theme-color" content="#0a0d16">
+  <title>No Cloud Media Center</title>
+  <meta name="description" content="A LAN media center served straight out of a shared folder by No Cloud Quick Share: drop movies and TV episodes into two folders and stream them to any browser in the house.">
+  <!-- Same discipline as the sibling webapp demo: every asset path is RELATIVE, so the
+       identical folder works at the onion root and under /<token>/ with no build step and
+       no <base>. All style lives in app.css and all behavior in app.js - no inline
+       <style>, <script>, style= attribute or data: URI - so the folder runs unchanged
+       under a strict CSP (default-src 'self'). Views navigate by LOCATION HASH rather
+       than pathname (unlike the demo): media paths are arbitrarily nested
+       (TV/Show/Season 2/ep.mkv), which the host's single-segment SPA fallback cannot
+       carry across a refresh - a #/ route never touches the server at all. -->
+  <link rel="icon" href="assets/logo.svg">
+  <link rel="manifest" href="site.webmanifest">
+  <link rel="stylesheet" href="app.css">
+</head>
+<body>
+  <!-- The auditorium: a fixed, almost-black field with two slow projector glows.
+       Pure CSS gradients (no images); frozen under prefers-reduced-motion. -->
+  <div class="stage-glow" aria-hidden="true"></div>
+
+  <a class="skip" href="#view">Skip to content</a>
+
+  <header class="topbar" id="topbar">
+    <a class="brand" href="#/" aria-label="No Cloud Media Center - home">
+      <img src="assets/logo.svg" width="30" height="30" alt="">
+      <span class="brand-name">No&nbsp;Cloud <b>Media&nbsp;Center</b></span>
+    </a>
+    <nav id="nav" class="nav" aria-label="Library sections"></nav>
+    <form id="searchForm" class="search" role="search">
+      <svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="6.5"/><path d="M16 16l5 5"/></svg>
+      <input id="searchBox" type="search" placeholder="Search your library&hellip;"
+             aria-label="Search your library" autocomplete="off" spellcheck="false">
+      <kbd class="search-key" aria-hidden="true">/</kbd>
+    </form>
+    <div class="top-actions">
+      <button id="rescanBtn" class="icon-btn" type="button" title="Rescan the media folders" aria-label="Rescan the media folders">
+        <svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><path d="M20 12a8 8 0 1 1-2.4-5.7"/><path d="M20 3v4h-4"/></svg>
+      </button>
+      <button id="themeBtn" class="icon-btn" type="button" title="Theme: auto" aria-label="Switch color theme">
+        <svg class="ic th-auto" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="8.5"/><path d="M12 3.5v17"/><path d="M12 3.5a8.5 8.5 0 0 1 0 17" fill="currentColor" stroke="none"/></svg>
+        <svg class="ic th-dark" viewBox="0 0 24 24" aria-hidden="true"><path d="M20 13.5A8.5 8.5 0 1 1 10.5 4 7 7 0 0 0 20 13.5z"/></svg>
+        <svg class="ic th-light" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="4.5"/><path d="M12 2.5v3M12 18.5v3M2.5 12h3M18.5 12h3M5.3 5.3l2.1 2.1M16.6 16.6l2.1 2.1M18.7 5.3l-2.1 2.1M7.4 16.6l-2.1 2.1"/></svg>
+      </button>
+      <span id="transport" class="badge" title="How this page reached your browser">
+        <span class="dot"></span><span class="badge-txt">detecting&hellip;</span>
+      </span>
+    </div>
+  </header>
+
+  <main id="view" class="view" tabindex="-1">
+    <noscript><div class="panel pad"><p>The media center uses JavaScript to scan the shared
+      folder and drive its player. Without it, the folder still serves as plain files:
+      open <a href="Movies/">Movies/</a> or <a href="TV/">TV/</a> to browse and download
+      them from the host&rsquo;s built-in listing.</p></div></noscript>
+  </main>
+
+  <footer class="site-ft">
+    <img src="assets/logo.svg" width="18" height="18" alt="" aria-hidden="true">
+    <span>Served by <b>No Cloud Quick Share</b> &mdash; your files stream straight from the
+      shared folder over your own network. No cloud, no account, no tracking &mdash;
+      <i>the library exists only while the sharing window is open.</i></span>
+    <a href="#/help">Help</a>
+  </footer>
+  <script src="app.js" defer></script>
+</body>
+</html>
