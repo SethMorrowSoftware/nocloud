@@ -266,7 +266,9 @@ h1, h2, h3 { line-height: 1.2; margin: 0 0 .45em; letter-spacing: -.01em; }
   background: none; border: 0; color: var(--ink); font: inherit; font-weight: 550;
   outline: none; cursor: pointer;
 }
-.sel-wrap select option { color: #17202f; }
+/* the popup list is UA-drawn: force BOTH colors, or dark color-scheme renders our
+   near-black text on its own near-black popup */
+.sel-wrap select option { color: #17202f; background: #fff; }
 
 /* ------------------------------------------------------------------- grids --- */
 .grid {
@@ -280,7 +282,9 @@ h1, h2, h3 { line-height: 1.2; margin: 0 0 .45em; letter-spacing: -.01em; }
   scroll-snap-type: x proximity;
 }
 .hscroll > * { scroll-snap-align: start; }
-.hscroll .ccard { width: 300px; }
+/* the continue-watching strip holds wide cards: the TRACKS must widen (a fixed item
+   width inside 150px tracks would overlap its neighbours) */
+.hs-cc { grid-auto-columns: 300px; }
 .hscroll::-webkit-scrollbar { height: 8px; }
 .hscroll::-webkit-scrollbar-thumb { background: var(--line); border-radius: 99px; }
 
@@ -484,6 +488,9 @@ h1, h2, h3 { line-height: 1.2; margin: 0 0 .45em; letter-spacing: -.01em; }
   background: rgba(255, 255, 255, .22); cursor: pointer;
   transition: transform .12s ease;
 }
+/* an invisible halo makes the 5px strip a finger-sized target on touch screens
+   (pointer events land on .seek, so the position math is unchanged) */
+.seek::before { content: ''; position: absolute; left: 0; right: 0; top: -12px; bottom: -12px; }
 .seek:hover, .seek:focus-visible { transform: scaleY(1.7); }
 .seek-buf, .seek-fill {
   position: absolute; left: 0; top: 0; bottom: 0; width: 0; border-radius: 99px;
@@ -615,7 +622,7 @@ kbd {
   .badge { padding: .3em .5em; }
   .grid { grid-template-columns: repeat(auto-fill, minmax(110px, 1fr)); gap: 14px 10px; }
   .hscroll { grid-auto-columns: 118px; }
-  .hscroll .ccard { width: 260px; }
+  .hs-cc { grid-auto-columns: 260px; }
   .p-init { font-size: 30px; }
   .show-hero { flex-direction: row; gap: 14px; }
   .poster.hero { width: 104px; }

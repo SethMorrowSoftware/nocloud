@@ -47,7 +47,7 @@ No step 5.
   patterns; `Season 1` / `S2` / `Series 3` / `Specials` folders are understood.
 - **Poster wall** with real artwork (`poster.jpg`, `cover.png`, or an image named
   like the film) and handsome generated posters when there is none. Grid or list
-  view, sort by title / year / size, and a "Surprise me" shuffle.
+  view for movie sections, sort by title / year / size, and a "Surprise me" shuffle.
 - **A full player**: seek bar with buffer indicator, ±10s, playback speed, volume,
   fullscreen, keyboard shortcuts (Space, arrows, F, M, S, N, 0-9, < >), and
   Media-Session integration for lockscreen/media keys.
@@ -59,9 +59,11 @@ No step 5.
   player's CC menu. The app renders cues itself, so `.srt` works even though the
   host serves it as a plain byte stream - and styling is consistent everywhere.
 - **Honest fallbacks.** If the browser cannot decode a container/codec (`.avi`,
-  exotic audio), the player says so and offers the two escapes that always work:
-  **Copy stream URL** (paste into VLC / mpv - it is a plain HTTP URL) and
-  **Download** (served as an attachment via the host's `?dl=1`).
+  exotic audio), the player says so and offers the escapes: **Copy stream URL**
+  (paste into VLC / mpv - it is a plain HTTP URL) and **Download** (served as an
+  attachment via the host's `?dl=1`). On a Tor share the player leads with
+  Download instead - a stock VLC/mpv cannot reach a `.onion` address unless it
+  is Tor-proxied itself, and the app says so.
 - **Search** across titles, years, episode codes, and file names (press `/`).
 - **Dark / light / auto** theme, responsive from phone to TV-sized windows,
   `prefers-reduced-motion` respected, keyboard- and screen-reader-friendly.
@@ -135,9 +137,15 @@ Movies/ TV/       where your media goes (each ships with a README.txt of example
 The host streams any file faithfully; whether the *browser* can decode it is the
 only question. MP4 (H.264/AAC) and WebM play everywhere; MKV usually plays in
 Chrome/Edge; MOV in Safari (and Chrome for H.264); AVI rarely anywhere. For the
-rest, the player's *Copy stream URL* into VLC/mpv always works - the URL is a plain
-HTTP Range endpoint. If you re-encode, `H.264 + AAC in .mp4 with +faststart` is the
-universal answer.
+rest, the player's *Copy stream URL* into VLC/mpv works on any LAN share - the URL
+is a plain HTTP Range endpoint (over Tor, the player itself must be Tor-proxied;
+Download works regardless). If you re-encode, `H.264 + AAC in .mp4 with +faststart`
+is the universal answer.
+
+One address gotcha: a web-link share lives under `http://<ip>:<port>/<token>/` -
+**keep the trailing slash** if you retype it. The host does not canonicalize the
+bare `/<token>` form, so without the slash the page loads with a wrong base URL
+and its relative assets miss.
 
 ## Privacy, honestly
 

@@ -153,10 +153,16 @@
     if (words.length === 1) return words[0].slice(0, 2).toUpperCase();
     return (words[0][0] + words[1][0]).toUpperCase();
   }
+  // Shape-checked read: a stored value whose TYPE differs from the fallback's (an
+  // extension or another tab wrote garbage) is discarded, so no consumer ever
+  // dereferences a number as an object - vid.volume = NaN would throw and brick a view.
   function lsGet(key, fallback) {
     try {
       var v = JSON.parse(localStorage.getItem(key) || 'null');
-      return v === null ? fallback : v;
+      if (v === null) return fallback;
+      if (typeof v !== typeof fallback) return fallback;
+      if (Object.prototype.toString.call(v) !== Object.prototype.toString.call(fallback)) return fallback;
+      return v;
     } catch (e) { return fallback; }
   }
   function lsSet(key, val) {
@@ -250,12 +256,17 @@
   // E02/Ep02/Episode 2. Returns null when the name carries no episode signal.
   function parseEpisodeName(fileName) {
     var name = baseOf(fileName).replace(/[._]+/g, ' ');
-    var m = /\bS(\d{1,2})[ .\-]?E(\d{1,3})(?:[ .\-]?E?(\d{1,3}))?/i.exec(name);
+    // The second-episode group REQUIRES its own literal "E" and a non-digit boundary:
+    // an optional E would swallow the next numeric token ("S01E01 720p" -> ep2=720,
+    // title "p") on the single most common naming convention. A captured ep2 must
+    // also be a plausible neighbour (greater, and within a handful) or it is dropped.
+    var m = /\bS(\d{1,2})[ .\-]?E(\d{1,3})(?:[ .\-]?E(\d{1,3}))?(?=\D|$)/i.exec(name);
     var season = null, ep = null, ep2 = null, at = -1, len = 0;
     if (m) {
       season = +m[1]; ep = +m[2]; ep2 = m[3] ? +m[3] : null;
+      if (ep2 !== null && !(ep2 > ep && ep2 - ep < 10)) ep2 = null;
       at = m.index; len = m[0].length;
-    } else if ((m = /\b(\d{1,2})x(\d{2,3})\b/.exec(name))) {
+    } else if ((m = /\b(\d{1,2})x(\d{2,3})\b/i.exec(name))) {
       season = +m[1]; ep = +m[2]; at = m.index; len = m[0].length;
     } else if ((m = /\bE(?:p(?:isode)?)?[ .]?(\d{1,3})\b/i.exec(name))) {
       ep = +m[1]; at = m.index; len = m[0].length;
@@ -383,20 +394,32 @@
     return null;
   }
 
+  // After stripping the video's basename from a sidecar's, the remaining tail must be
+  // nothing but language-ish flags (en, English, forced, sdh, cc, track digits).
+  // Otherwise "The Matrix.en.srt" would also claim "The Matrix Reloaded.en.srt" -
+  // a plain prefix test attaches a SEQUEL's subtitles when both live in one folder.
+  function subTailIsLangish(tail) {
+    var parts = tail.split(/[ ._\-()[\]]+/).filter(Boolean);
+    for (var i = 0; i < parts.length; i++) {
+      var low = parts[i].toLowerCase();
+      if (!LANG_NAMES[low] && !/^\d{1,2}$/.test(low)) return false;
+    }
+    return true;
+  }
+
   // Match subtitle rows to one video: same-folder sidecars whose basename extends the
-  // video's, plus everything a Subs/ folder holds when the video stands alone.
-  // pDirEnc is the folder's OWN encoded path: row hrefs are folder-relative, but the
-  // player fetches them relative to the app root, so they are absolutized here.
+  // video's (by language-ish tokens only), plus everything a Subs/ folder holds when
+  // the video stands alone. pDirEnc is the folder's OWN encoded path: row hrefs are
+  // folder-relative, but the player fetches them relative to the app root, so they
+  // are absolutized here.
   function matchSubs(subRows, vidBase, soloVideo, pDirEnc) {
-    var out = [], seen = {}, i, s, b;
+    var out = [], seen = {}, i, s, b, vb = vidBase.toLowerCase();
     for (i = 0; i < subRows.length; i++) {
       s = subRows[i];
       b = baseOf(s.name).toLowerCase();
-      var isMine = b === vidBase.toLowerCase() ||
-        b.indexOf(vidBase.toLowerCase() + '.') === 0 ||
-        b.indexOf(vidBase.toLowerCase() + '_') === 0 ||
-        b.indexOf(vidBase.toLowerCase() + '-') === 0 ||
-        b.indexOf(vidBase.toLowerCase() + ' ') === 0;
+      var isMine = b === vb ||
+        (b.indexOf(vb) === 0 && /^[ ._\-]/.test(b.slice(vb.length)) &&
+         subTailIsLangish(b.slice(vb.length)));
       if (!isMine && !(soloVideo && s.fromSubsDir)) continue;
       if (seen[s.href]) continue;
       seen[s.href] = 1;
@@ -471,7 +494,8 @@
           var deeper = [];
           ls.dirs.forEach(function (d) {
             if (isSubsDir(d.name)) return;
-            if (depth + 1 <= SCAN_MAX_DEPTH - 1 && progress.folders < SCAN_MAX_FOLDERS) {
+            // same budget expression as the TV crawl, so both honor SCAN_MAX_DEPTH
+            if (depth + 1 <= SCAN_MAX_DEPTH && progress.folders < SCAN_MAX_FOLDERS) {
               deeper.push(walk(relPath + d.name + '/', relEnc + d.href, depth + 1));
             }
           });
@@ -616,7 +640,13 @@
   var scanStatus = { folders: 0, files: 0, label: '' };
   var INFO = null;         // /_qs/info payload (transport badge), or null
 
-  function libCacheKey() { return SS_LIBRARY + location.pathname; }
+  // The cache key carries a section-config fingerprint: an edited library.json (new
+  // section, repointed path) must invalidate the cached scan, or the nav (painted
+  // from the NEW config) and the views (fed by the OLD cache) contradict each other.
+  function libCacheKey() {
+    var fp = CONFIG.sections.map(function (s) { return s.id + ':' + s.path + ':' + s.kind; }).join('|');
+    return SS_LIBRARY + location.pathname + '#' + fp;
+  }
 
   function indexLibrary(lib) {
     lib.byPath = {}; lib.shows = {};
@@ -716,7 +746,17 @@
   function playHref(item) { return '#/play/' + encodeURIComponent(item.path); }
   function showHref(show) { return '#/show/' + encodeURIComponent(show.path); }
 
+  var hasRendered = false;
   function render() {
+    // A plain fragment ("#view" from the skip link) is NOT a route: keep the current
+    // view alive (do not tear down a playing video) and honor the anchor by focusing
+    // the target. Only #/... hashes drive the router.
+    if (hasRendered && location.hash && location.hash.indexOf('#/') !== 0) {
+      var anchor = document.getElementById(location.hash.slice(1));
+      if (anchor && anchor.focus) anchor.focus();
+      return;
+    }
+    hasRendered = true;
     if (currentCleanup) { try { currentCleanup(); } catch (e) { /* view teardown must never wedge the router */ } }
     currentCleanup = null;
     var r = parseHash();
@@ -903,9 +943,9 @@
       '<li>Drop your ' + (isTv ? 'shows' : 'movies') + ' in, like this:<pre class="code">' + esc(layout) + '</pre></li>' +
       '<li>Come back here and press <b>Rescan</b> ' + icon('refresh') + ' in the top bar.</li>' +
       '</ol>' +
-      '<p class="dim">Files can also be added from another device on the LAN: the host&rsquo;s optional ' +
-      '<b>web editor</b> (enable it in the sharing window, then open <code>/_edit</code>) uploads ' +
-      'straight into the shared folder.</p>' +
+      '<p class="dim">Media files must be copied onto the host machine itself - the host&rsquo;s optional ' +
+      '<b>web editor</b> (<code>/_edit</code>, LAN shares only) edits small text files like ' +
+      '<code>library.json</code> from a browser, but it is not built for multi-GB video uploads.</p>' +
       '</div>';
   }
 
@@ -921,7 +961,7 @@
 
     if (cont.length) {
       html += '<section class="rowsec"><h2>' + icon('clock') + ' Continue watching</h2>' +
-        '<div class="hscroll">' + cont.map(continueCardHtml).join('') + '</div></section>';
+        '<div class="hscroll hs-cc">' + cont.map(continueCardHtml).join('') + '</div></section>';
     }
 
     LIB.sections.forEach(function (sec) {
@@ -990,19 +1030,23 @@
       return a;
     }
 
-    var html = '<section class="sec-head"><h1>' + icon(isTv ? 'tv' : 'film') + ' ' + esc(sec.label) + '</h1>' +
-      '<div class="sec-tools">' +
+    var hasContent = items.length || (sec.loose && sec.loose.length);
+    // the tools only render when there is something to sort/shuffle/re-lay-out; the
+    // grid/list toggle is movies-only (shows have no list rendering to toggle to)
+    var tools = !hasContent ? '' : '<div class="sec-tools">' +
       '<label class="sel-wrap">' + icon('gauge') + '<select id="sortSel" aria-label="Sort by">' +
       '<option value="title"' + (sort === 'title' ? ' selected' : '') + '>A&ndash;Z</option>' +
       (!isTv ? '<option value="year"' + (sort === 'year' ? ' selected' : '') + '>Newest year</option>' : '') +
       '<option value="size"' + (sort === 'size' ? ' selected' : '') + '>Largest</option>' +
       '</select></label>' +
       (!isTv ? '<button id="shuffleBtn" class="btn ghost" type="button" title="Play something at random">' + icon('shuffle') + ' Surprise me</button>' : '') +
-      '<button id="modeBtn" class="icon-btn" type="button" title="Toggle grid / list view" aria-label="Toggle grid or list view">' +
-      icon(mode === 'grid' ? 'list' : 'grid') + '</button>' +
-      '</div></section>';
+      (!isTv ? '<button id="modeBtn" class="icon-btn" type="button" title="Toggle grid / list view" aria-label="Toggle grid or list view">' +
+        icon(mode === 'grid' ? 'list' : 'grid') + '</button>' : '') +
+      '</div>';
+    var html = '<section class="sec-head"><h1>' + icon(isTv ? 'tv' : 'film') + ' ' + esc(sec.label) + '</h1>' +
+      tools + '</section>';
 
-    if (!items.length && !(sec.loose && sec.loose.length)) {
+    if (!hasContent) {
       html += emptySectionHtml(sec);
       view.innerHTML = html;
       return;
@@ -1189,6 +1233,7 @@
     var chips = (item.chips || []).slice();
     chips.push(item.ext.toUpperCase());
     if (PLAYABILITY[item.ext] === 1) chips.push('may not play in every browser');
+    else if (PLAYABILITY[item.ext] === 0) chips.push('usually needs VLC or Download');
     var headTitle = item.kind === 'episode'
       ? (item.show ? item.show : 'Episode')
       : item.title + (item.year ? ' (' + item.year + ')' : '');
@@ -1219,13 +1264,13 @@
       (nextEp ? '<button class="cbtn" id="nextBtn" type="button" aria-label="Next episode (n)">' + icon('next') + '</button>' : '') +
       '<span class="ctl-time" id="timeLbl">0:00 / 0:00</span>' +
       '<span class="ctl-spacer"></span>' +
-      (item.subs && item.subs.length ? '<button class="cbtn" id="subBtn" type="button" aria-label="Subtitles (s)" title="Subtitles">' + icon('cc') + '</button>' : '') +
-      '<button class="cbtn" id="rateBtn" type="button" aria-label="Playback speed" title="Playback speed"><span class="rate-lbl">1&times;</span></button>' +
+      (item.subs && item.subs.length ? '<button class="cbtn" id="subBtn" type="button" aria-label="Subtitles (s)" title="Subtitles" aria-haspopup="menu" aria-expanded="false">' + icon('cc') + '</button>' : '') +
+      '<button class="cbtn" id="rateBtn" type="button" aria-label="Playback speed" title="Playback speed" aria-haspopup="menu" aria-expanded="false"><span class="rate-lbl">1&times;</span></button>' +
       '<button class="cbtn" id="muteBtn" type="button" aria-label="Mute (m)">' + icon('vol') + '</button>' +
       '<input class="vol" id="volSlider" type="range" min="0" max="100" step="1" value="100" aria-label="Volume">' +
       '<button class="cbtn" id="fullBtn" type="button" aria-label="Fullscreen (f)">' + icon('full') + '</button>' +
       '</div></div>' +
-      '<div class="ctl-menu" id="ctlMenu" hidden></div>' +
+      '<div class="ctl-menu" id="ctlMenu" role="menu" hidden></div>' +
       '</div>' +
 
       '<div class="p-meta panel pad">' +
@@ -1259,9 +1304,13 @@
     var ctlMenu = $('#ctlMenu');
     var disposed = false, idleTimer = null, saveTimer = null, rafId = 0;
     var cues = null, cueIdx = 0, activeSub = -1, wakeLock = null, nextTimer = null;
+    var lastCueHtml = '', menuAnchor = null;
 
+    // Belt and suspenders on top of lsGet's shape check: vid.volume is a WebIDL
+    // restricted double, so a NaN assignment THROWS and would kill the whole view.
     var vol = lsGet(LS_VOLUME, { v: 1, muted: false });
-    vid.volume = Math.max(0, Math.min(1, vol.v));
+    var vol0 = +vol.v;
+    vid.volume = isFinite(vol0) ? Math.max(0, Math.min(1, vol0)) : 1;
     vid.muted = !!vol.muted;
     volSlider.value = String(Math.round(vid.volume * 100));
 
@@ -1333,8 +1382,9 @@
     seek.addEventListener('pointermove', function (ev) { if (seekDrag) seekFromPointer(ev); });
     seek.addEventListener('pointerup', function () { seekDrag = false; });
     seek.addEventListener('keydown', function (ev) {
-      if (ev.key === 'ArrowLeft') { seekBy(-10); ev.preventDefault(); }
-      if (ev.key === 'ArrowRight') { seekBy(10); ev.preventDefault(); }
+      // stopPropagation: the document-level onKey would seek AGAIN (20 s per press)
+      if (ev.key === 'ArrowLeft') { seekBy(-10); ev.preventDefault(); ev.stopPropagation(); }
+      if (ev.key === 'ArrowRight') { seekBy(10); ev.preventDefault(); ev.stopPropagation(); }
     });
 
     // ------------------------------------------------------- subtitles -----
@@ -1343,7 +1393,9 @@
     function parseSubText(text) {
       var t = String(text).replace(/^\uFEFF/, '').replace(/\r\n?/g, '\n');
       var isVtt = /^WEBVTT/.test(t);
-      var blocks = t.split(/\n{2,}/);
+      // separator lines padded with spaces/tabs still delimit cue blocks - without
+      // this, a whole file collapses into one cue that displays raw timestamps
+      var blocks = t.replace(/\n[ \t]+\n/g, '\n\n').split(/\n{2,}/);
       var out = [];
       var timeRe = /(?:(\d{1,2}):)?(\d{1,2}):(\d{2})[.,](\d{1,3})\s*-->\s*(?:(\d{1,2}):)?(\d{1,2}):(\d{2})[.,](\d{1,3})/;
       blocks.forEach(function (b) {
@@ -1381,12 +1433,15 @@
         else if (i === cueIdx) cueIdx++;
       }
       var htmlNow = active.length ? '<span class="cue">' + active.join('<br>') + '</span>' : '';
-      if (subLayer.innerHTML !== htmlNow) subLayer.innerHTML = htmlNow;
+      // compare against what was last SET, not what the DOM serializes back: the
+      // innerHTML getter returns &#39; as a literal apostrophe, so a DOM comparison
+      // is permanently unequal for any cue with a quote and rewrites every frame
+      if (lastCueHtml !== htmlNow) { lastCueHtml = htmlNow; subLayer.innerHTML = htmlNow; }
     }
 
     function selectSub(idx) {
       activeSub = idx;
-      cues = null; cueIdx = 0; subLayer.innerHTML = '';
+      cues = null; cueIdx = 0; subLayer.innerHTML = ''; lastCueHtml = '';
       if (idx < 0) { toast('Subtitles off'); return; }
       var sub = item.subs[idx];
       fetch(sub.href).then(function (r) {
@@ -1404,23 +1459,33 @@
     }
 
     // ----------------------------------------------------- small menus -----
-    function closeMenu() { ctlMenu.hidden = true; ctlMenu.innerHTML = ''; }
+    function closeMenu() {
+      ctlMenu.hidden = true; ctlMenu.innerHTML = '';
+      if (menuAnchor) { menuAnchor.setAttribute('aria-expanded', 'false'); menuAnchor = null; }
+    }
     function openMenu(items2, anchor) {
       ctlMenu.innerHTML = items2.map(function (m, i) {
-        return '<button type="button" class="menu-it' + (m.on ? ' on' : '') + '" data-i="' + i + '">' +
+        return '<button type="button" role="menuitemradio" aria-checked="' + (m.on ? 'true' : 'false') +
+          '" class="menu-it' + (m.on ? ' on' : '') + '" data-i="' + i + '">' +
           (m.on ? icon('check') : '<span class="menu-pad"></span>') + esc(m.label) + '</button>';
       }).join('');
       ctlMenu.hidden = false;
+      menuAnchor = anchor;
+      anchor.setAttribute('aria-expanded', 'true');
       // pin above the anchoring button, right-aligned to it
       var ar = anchor.getBoundingClientRect(), sr = stage.getBoundingClientRect();
       ctlMenu.style.right = Math.max(8, sr.right - ar.right) + 'px';
       $all('.menu-it', ctlMenu).forEach(function (b) {
         b.addEventListener('click', function () {
           var pick = items2[+b.getAttribute('data-i')];
+          var back = menuAnchor;
           closeMenu();
+          if (back) back.focus();
           if (pick && pick.act) pick.act();
         });
       });
+      var on = $('.menu-it.on', ctlMenu);
+      if (on) on.focus();
     }
 
     var subBtn = $('#subBtn');
@@ -1467,18 +1532,36 @@
     }
 
     // ------------------------------------------------------ media events ---
+    function requestWake() {
+      if ('wakeLock' in navigator && !wakeLock) {   // only granted in a secure context; fail soft
+        navigator.wakeLock.request('screen').then(function (l) {
+          wakeLock = l;
+          // the OS releases the lock when the tab hides WITHOUT pausing the video -
+          // null the stale sentinel so the visibilitychange below can re-acquire
+          l.addEventListener('release', function () { if (wakeLock === l) wakeLock = null; });
+        }, function () { });
+      }
+    }
+    function onVisible() {
+      if (!document.hidden && !vid.paused) requestWake();
+    }
+    document.addEventListener('visibilitychange', onVisible);
     vid.addEventListener('play', function () {
       setIcon(playBtn, 'pause'); wake(); startLoop();
-      if ('wakeLock' in navigator && !wakeLock) {   // only granted in a secure context; fail soft
-        navigator.wakeLock.request('screen').then(function (l) { wakeLock = l; }, function () { });
-      }
+      requestWake();
+      // resuming playback cancels a pending auto-advance - the user chose to stay
+      if (nextTimer) { clearInterval(nextTimer); nextTimer = null; }
+      nextOver.hidden = true;
     });
     vid.addEventListener('pause', function () {
       setIcon(playBtn, 'play'); stage.classList.remove('idle'); saveProgress(false);
       if (wakeLock) { try { wakeLock.release(); } catch (e) { } wakeLock = null; }
     });
     vid.addEventListener('timeupdate', function () { paintSeek(); paintCues(); });
-    vid.addEventListener('seeking', function () { cueIdx = 0; });
+    vid.addEventListener('seeking', function () {
+      cueIdx = 0;
+      if (nextTimer) { clearInterval(nextTimer); nextTimer = null; nextOver.hidden = true; }
+    });
     vid.addEventListener('progress', paintSeek);
     vid.addEventListener('loadedmetadata', function () {
       paintSeek();
@@ -1501,17 +1584,29 @@
     });
     vid.addEventListener('error', function () {
       // The honest fallback: the bytes stream fine (the host is a Range pipe), the
-      // BROWSER just cannot decode this container/codec. Offer the paths that work.
+      // BROWSER just cannot decode this container/codec. Offer the paths that work -
+      // and over Tor, say that a stock VLC/mpv cannot reach a .onion URL by itself.
+      var onTor = (INFO && INFO.mode === 'tor') || /\.onion$/i.test(location.hostname);
       stageNote.innerHTML = '<div class="note-card">' + icon('warn') +
         '<h3>This browser can&rsquo;t decode ' + esc(item.ext.toUpperCase()) + ' · ' + esc(item.file) + '</h3>' +
         '<p>The file itself streams fine - it is the video decoder that is missing. Try one of these:</p>' +
         '<div class="next-row">' +
-        '<button class="btn primary" id="vlcCopy" type="button">' + icon('link') + ' Copy URL for VLC / mpv</button>' +
-        '<a class="btn ghost" href="' + esc(dlHref(item.enc)) + '">' + icon('down') + ' Download the file</a></div>' +
-        '<p class="dim">In VLC: Media &rarr; Open Network Stream and paste the URL. Chrome and Edge usually ' +
-        'play MKV; MP4 (H.264/AAC) and WebM play everywhere.</p></div>';
+        (onTor
+          ? '<a class="btn primary" href="' + esc(dlHref(item.enc)) + '">' + icon('down') + ' Download the file</a>' +
+            '<button class="btn ghost" id="vlcCopy" type="button">' + icon('link') + ' Copy URL for VLC / mpv</button>'
+          : '<button class="btn primary" id="vlcCopy" type="button">' + icon('link') + ' Copy URL for VLC / mpv</button>' +
+            '<a class="btn ghost" href="' + esc(dlHref(item.enc)) + '">' + icon('down') + ' Download the file</a>') +
+        '</div>' +
+        '<p class="dim">' + (onTor
+          ? 'This is a .onion address: the Download rides your Tor browser, but VLC/mpv only work if they are Tor-proxied themselves. '
+          : 'In VLC: Media &rarr; Open Network Stream and paste the URL. ') +
+        'Chrome and Edge usually play MKV; MP4 (H.264/AAC) and WebM play everywhere.</p></div>';
       stageNote.hidden = false;
       ctl.classList.add('gone');
+      var vc = $('#vlcCopy');
+      if (vc) vc.addEventListener('click', function () {
+        copyText(absUrl(item.enc), 'Stream URL copied - paste it into VLC or mpv');
+      });
     });
 
     playBtn.addEventListener('click', togglePlay);
@@ -1580,6 +1675,11 @@
       }
       else if (k === '<' || k === ',') bumpRate(-1);
       else if (k === '>' || k === '.') bumpRate(1);
+      else if (k === 'Escape' && !ctlMenu.hidden) {
+        var back = menuAnchor;
+        closeMenu();
+        if (back) back.focus();
+      }
       wake();
     }
     function bumpRate(dir) {
@@ -1628,6 +1728,7 @@
       document.removeEventListener('keydown', onKey);
       document.removeEventListener('fullscreenchange', onFullChange);
       window.removeEventListener('pagehide', onUnload);
+      document.removeEventListener('visibilitychange', onVisible);
       if (wakeLock) { try { wakeLock.release(); } catch (e) { } wakeLock = null; }
       if (document.fullscreenElement) { try { document.exitFullscreen(); } catch (e) { } }
     };
@@ -1674,8 +1775,11 @@
       '<tr><td>MOV</td><td>Safari; Chrome when the codecs are H.264/AAC</td></tr>' +
       '<tr><td>AVI and others</td><td>rarely - use the player&rsquo;s <b>Copy stream URL</b> and paste it into VLC or mpv, or Download</td></tr>' +
       '</table>' +
-      '<p class="dim">When the browser cannot decode a file the player says so and offers both escapes. ' +
-      'Subtitles: sidecar <code>.srt</code> / <code>.vtt</code> files are detected and rendered by the app itself, ' +
+      '<p class="dim">When the browser cannot decode a file the player says so and offers both escapes.' +
+      (mode === 'tor'
+        ? ' Note: this share is a <b>.onion</b> address - a stock VLC/mpv cannot reach it unless it is Tor-proxied itself; the Download escape rides your Tor browser and always works.'
+        : '') +
+      ' Subtitles: sidecar <code>.srt</code> / <code>.vtt</code> files are detected and rendered by the app itself, ' +
       'so both formats work on every transport.</p></div>' +
 
       '<div class="panel pad"><h2>Keyboard shortcuts (in the player)</h2>' +
@@ -1747,6 +1851,7 @@
     if (btn) {
       btn.setAttribute('data-mode', t);
       btn.title = 'Theme: ' + t;
+      btn.setAttribute('aria-label', 'Theme: ' + t + ' - switch color theme');
     }
   }
   function cycleTheme() {
