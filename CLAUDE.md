@@ -1,13 +1,32 @@
 # CLAUDE.md
 
-Guidance for Claude Code (claude.ai/code) and human contributors working in this
-repository. **These instructions override default behavior; follow them exactly.**
+Guidance for Claude Code (claude.ai/code) and human contributors working in the
+**nocloud member of the xtalk-suite monorepo** (`nocloud/`). **These instructions
+override default behavior; follow them exactly.**
 
 This is the operational as-built record and the hard-won-lesson list for **No Cloud
 Quick Share**, in the same spirit as the `CLAUDE.md` files in the sibling OpenXTalk
 extensions it is built on (TorrentXT, cryptoXT/SodiumXT, OnionXT, and their
 ancestors Box2Dxt and ShowControl). Most rules below were earned at the cost of a
 runtime error, a crash, or a silent misbehavior — several of them in this app.
+
+> **Folded into the monorepo 2026-08-13.** This directory was copied verbatim
+> (via `git archive`, tracked files only) from the standalone repository, which
+> becomes a mirror; development happens here now, like every other member. Two
+> things changed in the fold and one holds going forward: (1)
+> `tools/check-livecodescript.py` was REPLACED with the suite's unified checker
+> (this copy predated the 2026-08-12 unification; the union checker is stricter,
+> and the app passed it clean on first contact), and the copy is now held
+> byte-identical by the suite's `tools/check-checker-drift.py` and
+> fixture-tested by `tools/test-checker.py` - never edit it here alone. (2) The
+> suite's `tools/build-all.sh` runs this member's gates (checker +
+> `tests/fileserver_golden.py`) in its member loop, and the suite-level
+> `tools/check-handler-calls.py` and `tools/check-stack-size.py` (the 720p
+> budget: stacks fit 1200 x 640 - this app's two-column dashboard already did)
+> now walk this directory on every push. Where this file and the suite root
+> `CLAUDE.md` conflict, this file wins inside `nocloud/`; paths in the docs
+> below may still read as if this were its own repo root (the suite's standing
+> consolidation-debt caveat).
 
 ## What this is
 
